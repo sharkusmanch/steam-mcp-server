@@ -1,0 +1,49 @@
+{
+  "name": "steam-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for Steam Web API - access game library, achievements, and player data",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "steam-mcp-server": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "steam",
+    "steam-api",
+    "claude",
+    "ai",
+    "llm"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sharkusmanch/steam-mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sharkusmanch/steam-mcp-server/issues"
+  },
+  "homepage": "https://github.com/sharkusmanch/steam-mcp-server#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
