@@ -1,3 +1,16 @@
+## v0.3.0 (2025-12-05)
+
+### Bug Fixes
+
+- make release workflow manually triggered
+- update dependency zod to v4
+
+### Other Changes
+
+- Merge pull request #6 from sharkusmanch/renovate/node-24.x
+- Merge pull request #8 from sharkusmanch/renovate/zod-4.x
+
+
 # Changelog
 
 ## v0.2.0 (2025-12-05)
