@@ -15,18 +15,131 @@ if (!apiKey) {
 
 const steam = new SteamClient({ apiKey });
 
+// Security: Validate Steam ID format (17-digit numeric string for 64-bit Steam IDs)
+const STEAM_ID_REGEX = /^[0-9]{17}$/;
+
+function isValidSteamId(steamId: string): boolean {
+  return STEAM_ID_REGEX.test(steamId);
+}
+
 function getSteamId(providedId?: string): string {
   const steamId = providedId || defaultSteamId;
   if (!steamId) {
     throw new Error("No Steam ID provided and STEAM_ID environment variable not set");
   }
+  if (!isValidSteamId(steamId)) {
+    throw new Error("Invalid Steam ID format. Must be a 17-digit numeric string.");
+  }
   return steamId;
+}
+
+// Security: Validate vanity URL format (alphanumeric, underscores, hyphens only)
+const VANITY_URL_REGEX = /^[a-zA-Z0-9_-]{1,32}$/;
+
+function isValidVanityUrl(vanityUrl: string): boolean {
+  return VANITY_URL_REGEX.test(vanityUrl);
+}
+
+// Security: Validate IP address format and block private/internal ranges
+const IPV4_REGEX = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(:\d{1,5})?$/;
+
+function isPrivateIp(ip: string): boolean {
+  const ipWithoutPort = ip.split(':')[0];
+  const parts = ipWithoutPort.split('.').map(Number);
+
+  if (parts.length !== 4 || parts.some(p => p < 0 || p > 255)) {
+    return true; // Invalid IP, treat as blocked
+  }
+
+  // Block private ranges (RFC 1918) and special addresses
+  const [a, b, c, d] = parts;
+
+  // 10.0.0.0/8 - Private
+  if (a === 10) return true;
+  // 172.16.0.0/12 - Private
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  // 192.168.0.0/16 - Private
+  if (a === 192 && b === 168) return true;
+  // 127.0.0.0/8 - Loopback
+  if (a === 127) return true;
+  // 0.0.0.0/8 - Current network
+  if (a === 0) return true;
+  // 169.254.0.0/16 - Link-local
+  if (a === 169 && b === 254) return true;
+  // 224.0.0.0/4 - Multicast
+  if (a >= 224 && a <= 239) return true;
+  // 240.0.0.0/4 - Reserved
+  if (a >= 240) return true;
+
+  return false;
+}
+
+function isValidServerAddress(address: string): boolean {
+  // Must match IP:port or just IP format
+  if (!IPV4_REGEX.test(address)) {
+    return false;
+  }
+  // Block private/internal IP ranges (SSRF protection)
+  if (isPrivateIp(address)) {
+    return false;
+  }
+  return true;
+}
+
+// Security: Sanitize error messages to avoid information disclosure
+function sanitizeErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    // Remove potentially sensitive information from error messages
+    const message = error.message;
+    // Filter out stack traces and internal paths
+    if (message.includes('ENOTFOUND') || message.includes('ECONNREFUSED')) {
+      return "Network error: Unable to reach Steam API";
+    }
+    if (message.includes('401') || message.includes('403')) {
+      return "Authorization error: Check API key or profile privacy settings";
+    }
+    if (message.includes('404')) {
+      return "Not found: The requested resource does not exist";
+    }
+    if (message.includes('429')) {
+      return "Rate limited: Too many requests. Please try again later";
+    }
+    if (message.includes('500') || message.includes('502') || message.includes('503')) {
+      return "Steam API temporarily unavailable. Please try again later";
+    }
+    // Return the message if it appears safe (no paths or sensitive data)
+    if (!message.includes('/') && !message.includes('\\') && message.length < 200) {
+      return message;
+    }
+    return "An error occurred while processing your request";
+  }
+  return "Unknown error";
 }
 
 const steamIdSchema = z
   .string()
+  .regex(STEAM_ID_REGEX, "Must be a 17-digit Steam ID")
   .optional()
   .describe("64-bit Steam ID (optional if STEAM_ID env var is set)");
+
+// Security: Cache for app list to prevent resource exhaustion
+// Refreshes every 24 hours
+interface AppListCache {
+  apps: Array<{ appid: number; name: string }>;
+  timestamp: number;
+}
+let appListCache: AppListCache | null = null;
+const APP_LIST_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+async function getCachedAppList(): Promise<Array<{ appid: number; name: string }>> {
+  const now = Date.now();
+  if (appListCache && (now - appListCache.timestamp) < APP_LIST_CACHE_TTL) {
+    return appListCache.apps;
+  }
+  const apps = await steam.getAppList();
+  appListCache = { apps, timestamp: now };
+  return apps;
+}
 
 // Helper for parallel processing with concurrency limit
 async function parallelMap<T, R>(
@@ -118,9 +231,17 @@ server.tool(
   {
     vanity_url: z
       .string()
+      .min(1)
+      .max(32)
       .describe("The vanity URL part (e.g., 'gaben' from steamcommunity.com/id/gaben)"),
   },
   async ({ vanity_url }) => {
+    // Security: Validate vanity URL format
+    if (!isValidVanityUrl(vanity_url)) {
+      return {
+        content: [{ type: "text", text: "Invalid vanity URL format. Use only letters, numbers, underscores, and hyphens (1-32 characters)." }],
+      };
+    }
     const steamId = await steam.resolveVanityUrl(vanity_url);
     if (!steamId) {
       return { content: [{ type: "text", text: "Vanity URL not found" }] };
@@ -247,7 +368,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch achievements: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch achievements: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -273,7 +394,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch stats: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch stats: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -469,7 +590,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch inventory: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch inventory: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -499,7 +620,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch TF2 inventory: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch TF2 inventory: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -529,7 +650,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch CS2 inventory: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch CS2 inventory: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -559,7 +680,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch Dota 2 inventory: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch Dota 2 inventory: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -601,7 +722,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch badges: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch badges: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -700,7 +821,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch player count: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch player count: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -745,7 +866,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch game schema: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch game schema: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -777,7 +898,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch groups: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch groups: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -809,7 +930,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch badge progress: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch badge progress: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -851,7 +972,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not check shared game: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not check shared game: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -881,7 +1002,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch global stats: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch global stats: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -895,16 +1016,19 @@ server.tool(
   "search_apps",
   "Search for Steam apps by name (searches the full Steam catalog)",
   {
-    query: z.string().describe("Search query to match against app names"),
+    query: z.string().min(1).max(100).describe("Search query to match against app names"),
     limit: z
       .number()
+      .min(1)
+      .max(100)
       .optional()
       .default(25)
-      .describe("Max results to return (default 25)"),
+      .describe("Max results to return (default 25, max 100)"),
   },
   async ({ query, limit }) => {
     try {
-      const allApps = await steam.getAppList();
+      // Security: Use cached app list to prevent repeated large API calls
+      const allApps = await getCachedAppList();
       const queryLower = query.toLowerCase();
       const matches = allApps
         .filter((app) => app.name.toLowerCase().includes(queryLower))
@@ -926,7 +1050,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not search apps: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not search apps: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -938,9 +1062,20 @@ server.tool(
   "get_servers_at_address",
   "Get game servers running at a specific IP address",
   {
-    address: z.string().describe("IP address or IP:port to query"),
+    address: z.string().describe("IP address or IP:port to query (public IPs only)"),
   },
   async ({ address }) => {
+    // Security: Validate IP address format and block private/internal ranges (SSRF protection)
+    if (!isValidServerAddress(address)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Invalid address format. Must be a public IPv4 address (e.g., '203.0.113.1' or '203.0.113.1:27015'). Private and internal IP ranges are not allowed.",
+          },
+        ],
+      };
+    }
     try {
       const servers = await steam.getServersAtAddress(address);
       return {
@@ -960,7 +1095,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not fetch servers: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not fetch servers: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
@@ -1000,7 +1135,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Could not check update: ${error instanceof Error ? error.message : "Unknown error"}`,
+            text: `Could not check update: ${sanitizeErrorMessage(error)}`,
           },
         ],
       };
