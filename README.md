@@ -20,9 +20,11 @@ npm install
 npm run build
 ```
 
-### 4. Configure in Claude Desktop
+### 4. Configure Your MCP Client
 
-Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+#### Claude Code
+
+Add to your Claude Code settings file (`~/.claude/settings.json`):
 
 ```json
 {
@@ -30,6 +32,82 @@ Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/
     "steam": {
       "command": "node",
       "args": ["/path/to/steam-mcp-server/dist/index.js"],
+      "env": {
+        "STEAM_API_KEY": "your-api-key-here",
+        "STEAM_ID": "your-64-bit-steam-id"
+      }
+    }
+  }
+}
+```
+
+Or use npx (no build required):
+
+```json
+{
+  "mcpServers": {
+    "steam": {
+      "command": "npx",
+      "args": ["-y", "steam-mcp-server"],
+      "env": {
+        "STEAM_API_KEY": "your-api-key-here",
+        "STEAM_ID": "your-64-bit-steam-id"
+      }
+    }
+  }
+}
+```
+
+#### Claude Desktop
+
+Add to your Claude Desktop configuration:
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "steam": {
+      "command": "npx",
+      "args": ["-y", "steam-mcp-server"],
+      "env": {
+        "STEAM_API_KEY": "your-api-key-here",
+        "STEAM_ID": "your-64-bit-steam-id"
+      }
+    }
+  }
+}
+```
+
+#### Cursor
+
+Add to Cursor's MCP settings (`.cursor/mcp.json` in your project or global config):
+
+```json
+{
+  "mcpServers": {
+    "steam": {
+      "command": "npx",
+      "args": ["-y", "steam-mcp-server"],
+      "env": {
+        "STEAM_API_KEY": "your-api-key-here",
+        "STEAM_ID": "your-64-bit-steam-id"
+      }
+    }
+  }
+}
+```
+
+#### Windsurf
+
+Add to Windsurf's MCP configuration (`~/.windsurf/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "steam": {
+      "command": "npx",
+      "args": ["-y", "steam-mcp-server"],
       "env": {
         "STEAM_API_KEY": "your-api-key-here",
         "STEAM_ID": "your-64-bit-steam-id"
