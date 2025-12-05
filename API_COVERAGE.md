@@ -62,6 +62,20 @@ This document details which Steam Web API endpoints are implemented in this MCP 
 |----------|------|-------|
 | /api/appdetails | `get_game_details` | Game info, price, requirements |
 
+### IWishlistService
+| Method | Tool | Notes |
+|--------|------|-------|
+| GetWishlist | `get_wishlist` | User's wishlist with priorities |
+| GetWishlistItemCount | `get_wishlist_item_count` | Number of wishlists for app |
+
+### IEconService
+| Method | Tool | Notes |
+|--------|------|-------|
+| GetTradeOffers | `get_trade_offers` | Active trade offers |
+| GetTradeOffer | `get_trade_offer` | Single trade offer details |
+| GetTradeOffersSummary | `get_trade_offers_summary` | Pending trade counts |
+| GetTradeHistory | `get_trade_history` | Completed trade history |
+
 ---
 
 ## Not Yet Implemented
@@ -70,20 +84,6 @@ This document details which Steam Web API endpoints are implemented in this MCP 
 | Method | Description | Difficulty |
 |--------|-------------|------------|
 | GetAppList | Featured/sale items | Medium |
-| GetWishlistCount | Number of wishlists for app | Medium |
-
-### IWishlistService
-| Method | Description | Difficulty |
-|--------|-------------|------------|
-| GetWishlist | User's wishlist | Medium |
-| GetWishlistSortedFiltered | Sorted/filtered wishlist | Medium |
-
-### IEconService
-| Method | Description | Difficulty |
-|--------|-------------|------------|
-| GetTradeHistory | Trade history | Medium |
-| GetTradeOffers | Active trade offers | Medium |
-| GetTradeOffersSummary | Pending trade counts | Easy |
 
 ### IEconMarketService
 | Method | Description | Difficulty |
@@ -146,10 +146,17 @@ All high-priority APIs have been implemented:
 - ~~`GetSchemaForGame`~~ ✅ `get_game_schema`
 
 ### Medium Priority (Useful additions)
-1. `GetWishlist` - Wishlist management
-2. `GetTradeOffers` - Trading functionality
-3. `GetMatchHistory` (Dota 2) - Match history
-4. `GetAppList` - Search for games
+All medium-priority APIs have been implemented:
+- ~~`GetWishlist`~~ ✅ `get_wishlist`
+- ~~`GetWishlistItemCount`~~ ✅ `get_wishlist_item_count`
+- ~~`GetTradeOffers`~~ ✅ `get_trade_offers`
+- ~~`GetTradeOffer`~~ ✅ `get_trade_offer`
+- ~~`GetTradeOffersSummary`~~ ✅ `get_trade_offers_summary`
+- ~~`GetTradeHistory`~~ ✅ `get_trade_history`
+
+### Future Additions
+1. `GetMatchHistory` (Dota 2) - Match history
+2. `GetAppList` (IStoreService) - Featured/sale items
 
 ### Low Priority (Niche use cases)
 1. Game server queries

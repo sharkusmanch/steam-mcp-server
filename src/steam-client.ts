@@ -235,6 +235,73 @@ export interface AppUpdateInfo {
   message?: string;
 }
 
+// Wishlist types
+export interface WishlistItem {
+  appid: number;
+  priority: number;
+  date_added: number;
+}
+
+// Trade types
+export interface TradeOfferAsset {
+  appid: number;
+  contextid: string;
+  assetid: string;
+  classid: string;
+  instanceid: string;
+  amount: string;
+  missing?: boolean;
+}
+
+export interface TradeOffer {
+  tradeofferid: string;
+  accountid_other: number;
+  message: string;
+  expiration_time: number;
+  trade_offer_state: number;
+  items_to_give?: TradeOfferAsset[];
+  items_to_receive?: TradeOfferAsset[];
+  is_our_offer: boolean;
+  time_created: number;
+  time_updated: number;
+  from_real_time_trade: boolean;
+  escrow_end_date?: number;
+  confirmation_method?: number;
+}
+
+export interface TradeOffersResponse {
+  trade_offers_sent?: TradeOffer[];
+  trade_offers_received?: TradeOffer[];
+  next_cursor?: number;
+}
+
+export interface TradeOffersSummary {
+  pending_received_count: number;
+  new_received_count: number;
+  updated_received_count: number;
+  historical_received_count: number;
+  pending_sent_count: number;
+  newly_accepted_sent_count: number;
+  historical_sent_count: number;
+  escrow_received_count: number;
+  escrow_sent_count: number;
+}
+
+export interface TradeHistoryTrade {
+  tradeid: string;
+  steamid_other: string;
+  time_init: number;
+  status: number;
+  assets_given?: TradeOfferAsset[];
+  assets_received?: TradeOfferAsset[];
+}
+
+export interface TradeHistoryResponse {
+  trades: TradeHistoryTrade[];
+  more: boolean;
+  total_trades?: number;
+}
+
 export class SteamClient {
   private apiKey: string;
 
@@ -564,5 +631,78 @@ export class SteamClient {
       version,
     });
     return data.response;
+  }
+
+  // === Wishlist Methods ===
+
+  async getWishlist(steamId: string): Promise<WishlistItem[]> {
+    const data = await this.request<{
+      response: { items: Array<{ appid: number; priority: number; date_added: number }> };
+    }>("IWishlistService", "GetWishlist", 1, {
+      steamid: steamId,
+    });
+    return data.response?.items ?? [];
+  }
+
+  async getWishlistItemCount(appId: number): Promise<number> {
+    const data = await this.request<{
+      response: { count: number };
+    }>("IWishlistService", "GetWishlistItemCount", 1, {
+      appid: appId,
+    });
+    return data.response?.count ?? 0;
+  }
+
+  // === Trade Methods ===
+
+  async getTradeOffers(
+    getSentOffers = true,
+    getReceivedOffers = true,
+    activeOnly = true
+  ): Promise<TradeOffersResponse> {
+    const data = await this.request<{
+      response: TradeOffersResponse;
+    }>("IEconService", "GetTradeOffers", 1, {
+      get_sent_offers: getSentOffers,
+      get_received_offers: getReceivedOffers,
+      active_only: activeOnly,
+      get_descriptions: true,
+      time_historical_cutoff: Math.floor(Date.now() / 1000),
+    });
+    return data.response ?? { trade_offers_sent: [], trade_offers_received: [] };
+  }
+
+  async getTradeOffersSummary(): Promise<TradeOffersSummary> {
+    const data = await this.request<{
+      response: TradeOffersSummary;
+    }>("IEconService", "GetTradeOffersSummary", 1, {
+      time_last_visit: Math.floor(Date.now() / 1000) - 86400, // Last 24 hours
+    });
+    return data.response;
+  }
+
+  async getTradeHistory(
+    maxTrades = 30,
+    includeFailed = false,
+    includeTotal = true
+  ): Promise<TradeHistoryResponse> {
+    const data = await this.request<{
+      response: TradeHistoryResponse;
+    }>("IEconService", "GetTradeHistory", 1, {
+      max_trades: maxTrades,
+      get_descriptions: true,
+      include_failed: includeFailed,
+      include_total: includeTotal,
+    });
+    return data.response ?? { trades: [], more: false };
+  }
+
+  async getTradeOffer(tradeOfferId: string): Promise<TradeOffer | null> {
+    const data = await this.request<{
+      response: { offer: TradeOffer };
+    }>("IEconService", "GetTradeOffer", 1, {
+      tradeofferid: tradeOfferId,
+    });
+    return data.response?.offer ?? null;
   }
 }

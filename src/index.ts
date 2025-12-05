@@ -1143,6 +1143,329 @@ server.tool(
   }
 );
 
+// === Wishlist Tools ===
+
+server.tool(
+  "get_wishlist",
+  "Get a player's Steam wishlist with game IDs, priorities, and dates added",
+  {
+    steam_id: steamIdSchema,
+  },
+  async ({ steam_id }) => {
+    try {
+      const wishlist = await steam.getWishlist(getSteamId(steam_id));
+
+      // Sort by priority (lower priority number = higher on wishlist)
+      const sorted = [...wishlist].sort((a, b) => a.priority - b.priority);
+
+      const formatted = sorted.map((item) => ({
+        appid: item.appid,
+        priority: item.priority,
+        date_added: new Date(item.date_added * 1000).toISOString(),
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { wishlist_count: formatted.length, items: formatted },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Could not fetch wishlist: ${sanitizeErrorMessage(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_wishlist_item_count",
+  "Get the number of users who have a specific game on their wishlist",
+  {
+    app_id: z.number().describe("Steam application ID"),
+  },
+  async ({ app_id }) => {
+    try {
+      const count = await steam.getWishlistItemCount(app_id);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ app_id, wishlist_count: count }, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Could not fetch wishlist count: ${sanitizeErrorMessage(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// === Trade Tools ===
+
+// Trade offer state mapping
+const TRADE_OFFER_STATES: Record<number, string> = {
+  1: "Invalid",
+  2: "Active",
+  3: "Accepted",
+  4: "Countered",
+  5: "Expired",
+  6: "Canceled",
+  7: "Declined",
+  8: "InvalidItems",
+  9: "CreatedNeedsConfirmation",
+  10: "CanceledBySecondFactor",
+  11: "InEscrow",
+};
+
+server.tool(
+  "get_trade_offers",
+  "Get active trade offers (sent and/or received). Requires API key with trade permissions.",
+  {
+    get_sent: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include sent trade offers"),
+    get_received: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include received trade offers"),
+    active_only: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Only return active (pending) offers"),
+  },
+  async ({ get_sent, get_received, active_only }) => {
+    try {
+      const offers = await steam.getTradeOffers(get_sent, get_received, active_only);
+
+      const formatOffer = (offer: {
+        tradeofferid: string;
+        accountid_other: number;
+        message: string;
+        trade_offer_state: number;
+        items_to_give?: unknown[];
+        items_to_receive?: unknown[];
+        is_our_offer: boolean;
+        time_created: number;
+        expiration_time: number;
+      }) => ({
+        offer_id: offer.tradeofferid,
+        partner_account_id: offer.accountid_other,
+        message: offer.message || "(no message)",
+        state: TRADE_OFFER_STATES[offer.trade_offer_state] || "Unknown",
+        items_to_give: offer.items_to_give?.length ?? 0,
+        items_to_receive: offer.items_to_receive?.length ?? 0,
+        is_our_offer: offer.is_our_offer,
+        created: new Date(offer.time_created * 1000).toISOString(),
+        expires: new Date(offer.expiration_time * 1000).toISOString(),
+      });
+
+      const sent = (offers.trade_offers_sent ?? []).map(formatOffer);
+      const received = (offers.trade_offers_received ?? []).map(formatOffer);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                sent_count: sent.length,
+                received_count: received.length,
+                sent_offers: sent,
+                received_offers: received,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Could not fetch trade offers: ${sanitizeErrorMessage(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_trade_offers_summary",
+  "Get a summary of pending trade offers (counts only). Requires API key with trade permissions.",
+  {},
+  async () => {
+    try {
+      const summary = await steam.getTradeOffersSummary();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                pending_received: summary.pending_received_count,
+                new_received: summary.new_received_count,
+                updated_received: summary.updated_received_count,
+                pending_sent: summary.pending_sent_count,
+                escrow_received: summary.escrow_received_count,
+                escrow_sent: summary.escrow_sent_count,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Could not fetch trade summary: ${sanitizeErrorMessage(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_trade_history",
+  "Get completed trade history. Requires API key with trade permissions.",
+  {
+    max_trades: z
+      .number()
+      .min(1)
+      .max(100)
+      .optional()
+      .default(30)
+      .describe("Maximum number of trades to return (default 30, max 100)"),
+    include_failed: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Include failed/rolled-back trades"),
+  },
+  async ({ max_trades, include_failed }) => {
+    try {
+      const history = await steam.getTradeHistory(max_trades, include_failed, true);
+
+      const trades = history.trades.map((trade) => ({
+        trade_id: trade.tradeid,
+        partner_steam_id: trade.steamid_other,
+        time: new Date(trade.time_init * 1000).toISOString(),
+        status: trade.status,
+        items_given: trade.assets_given?.length ?? 0,
+        items_received: trade.assets_received?.length ?? 0,
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                total_trades: history.total_trades,
+                returned: trades.length,
+                has_more: history.more,
+                trades,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Could not fetch trade history: ${sanitizeErrorMessage(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_trade_offer",
+  "Get details of a specific trade offer by ID. Requires API key with trade permissions.",
+  {
+    trade_offer_id: z.string().describe("The trade offer ID to look up"),
+  },
+  async ({ trade_offer_id }) => {
+    try {
+      const offer = await steam.getTradeOffer(trade_offer_id);
+
+      if (!offer) {
+        return {
+          content: [{ type: "text", text: "Trade offer not found" }],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                offer_id: offer.tradeofferid,
+                partner_account_id: offer.accountid_other,
+                message: offer.message || "(no message)",
+                state: TRADE_OFFER_STATES[offer.trade_offer_state] || "Unknown",
+                items_to_give: offer.items_to_give ?? [],
+                items_to_receive: offer.items_to_receive ?? [],
+                is_our_offer: offer.is_our_offer,
+                created: new Date(offer.time_created * 1000).toISOString(),
+                updated: new Date(offer.time_updated * 1000).toISOString(),
+                expires: new Date(offer.expiration_time * 1000).toISOString(),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Could not fetch trade offer: ${sanitizeErrorMessage(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
 // Start server
 async function main() {
   const transport = new StdioServerTransport();
