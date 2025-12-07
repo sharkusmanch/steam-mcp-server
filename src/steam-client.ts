@@ -669,7 +669,7 @@ export class SteamClient {
       get_descriptions: true,
       time_historical_cutoff: Math.floor(Date.now() / 1000),
     });
-    return data.response ?? { trade_offers_sent: [], trade_offers_received: [] };
+    return data.response ?? {};
   }
 
   async getTradeOffersSummary(): Promise<TradeOffersSummary> {
