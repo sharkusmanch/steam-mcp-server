@@ -136,6 +136,12 @@ function getPersonaState(state: number): string {
   return states[state] ?? "Unknown";
 }
 
+// Helper to convert 32-bit account ID to 64-bit Steam ID
+const STEAM_ID_BASE = BigInt("76561197960265728");
+function accountIdToSteamId(accountId: number): string {
+  return (STEAM_ID_BASE + BigInt(accountId)).toString();
+}
+
 // Security: Cache for app list to prevent resource exhaustion
 // Refreshes every 24 hours
 interface AppListCache {
@@ -1308,7 +1314,7 @@ const TRADE_OFFER_STATES: Record<number, string> = {
 
 server.tool(
   "get_trade_offers",
-  "Get active trade offers (sent and/or received). Requires API key with trade permissions.",
+  "Get active trade offers with partner names. Requires API key with trade permissions.",
   {
     get_sent: z
       .boolean()
@@ -1325,10 +1331,32 @@ server.tool(
       .optional()
       .default(true)
       .describe("Only return active (pending) offers"),
+    include_partner_names: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include partner names (default: true)"),
   },
-  async ({ get_sent, get_received, active_only }) => {
+  async ({ get_sent, get_received, active_only, include_partner_names }) => {
     try {
       const offers = await steam.getTradeOffers(get_sent, get_received, active_only);
+      const allOffers = [
+        ...(offers.trade_offers_sent ?? []),
+        ...(offers.trade_offers_received ?? []),
+      ];
+
+      // Build partner name map if needed
+      let partnerNames = new Map<number, string>();
+      if (include_partner_names && allOffers.length > 0) {
+        const accountIds = [...new Set(allOffers.map((o) => o.accountid_other))];
+        const steamIds = accountIds.map(accountIdToSteamId);
+        const summaries = await steam.getPlayerSummaries(steamIds);
+        for (const player of summaries) {
+          // Convert back to account ID for lookup
+          const accountId = Number(BigInt(player.steamid) - STEAM_ID_BASE);
+          partnerNames.set(accountId, player.personaname);
+        }
+      }
 
       const formatOffer = (offer: {
         tradeofferid: string;
@@ -1342,7 +1370,8 @@ server.tool(
         expiration_time: number;
       }) => ({
         offer_id: offer.tradeofferid,
-        partner_account_id: offer.accountid_other,
+        partner_name: partnerNames.get(offer.accountid_other),
+        partner_steam_id: accountIdToSteamId(offer.accountid_other),
         message: offer.message || "(no message)",
         state: TRADE_OFFER_STATES[offer.trade_offer_state] || "Unknown",
         items_to_give: offer.items_to_give?.length ?? 0,
