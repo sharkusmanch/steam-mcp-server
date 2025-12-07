@@ -122,6 +122,20 @@ const steamIdSchema = z
   .optional()
   .describe("64-bit Steam ID (optional if STEAM_ID env var is set)");
 
+// Helper to convert persona state to readable string
+function getPersonaState(state: number): string {
+  const states: Record<number, string> = {
+    0: "Offline",
+    1: "Online",
+    2: "Busy",
+    3: "Away",
+    4: "Snooze",
+    5: "Looking to trade",
+    6: "Looking to play",
+  };
+  return states[state] ?? "Unknown";
+}
+
 // Security: Cache for app list to prevent resource exhaustion
 // Refreshes every 24 hours
 interface AppListCache {
@@ -199,15 +213,49 @@ server.tool(
 
 server.tool(
   "get_friends_list",
-  "Get a player's Steam friends list with relationship info",
+  "Get a player's Steam friends list with names and relationship info",
   {
     steam_id: steamIdSchema,
+    include_info: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include friend names and online status (default: true)"),
   },
-  async ({ steam_id }) => {
-    const friends = await steam.getFriendList(getSteamId(steam_id));
-    return {
-      content: [{ type: "text", text: JSON.stringify(friends, null, 2) }],
-    };
+  async ({ steam_id, include_info }) => {
+    try {
+      const friends = await steam.getFriendList(getSteamId(steam_id), include_info);
+
+      const formatted = friends.map((f) => ({
+        steam_id: f.steamid,
+        name: f.personaname,
+        relationship: f.relationship,
+        friend_since: new Date(f.friend_since * 1000).toISOString(),
+        status: f.personastate !== undefined ? getPersonaState(f.personastate) : undefined,
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { friend_count: formatted.length, friends: formatted },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Could not fetch friends list: ${sanitizeErrorMessage(error)}`,
+          },
+        ],
+      };
+    }
   }
 );
 

@@ -46,6 +46,9 @@ export interface Friend {
   steamid: string;
   relationship: string;
   friend_since: number;
+  personaname?: string;
+  avatar?: string;
+  personastate?: number;
 }
 
 export interface Achievement {
@@ -348,14 +351,41 @@ export class SteamClient {
     return data.response.players;
   }
 
-  async getFriendList(steamId: string): Promise<Friend[]> {
+  async getFriendList(steamId: string, includePlayerInfo = false): Promise<Friend[]> {
     const data = await this.request<{
       friendslist: { friends: Friend[] };
     }>("ISteamUser", "GetFriendList", 1, {
       steamid: steamId,
       relationship: "friend",
     });
-    return data.friendslist?.friends ?? [];
+    const friends = data.friendslist?.friends ?? [];
+
+    if (includePlayerInfo && friends.length > 0) {
+      // GetPlayerSummaries supports up to 100 IDs at once
+      const BATCH_SIZE = 100;
+      const steamIds = friends.map((f) => f.steamid);
+      const playerMap = new Map<string, PlayerSummary>();
+
+      for (let i = 0; i < steamIds.length; i += BATCH_SIZE) {
+        const batch = steamIds.slice(i, i + BATCH_SIZE);
+        const summaries = await this.getPlayerSummaries(batch);
+        for (const player of summaries) {
+          playerMap.set(player.steamid, player);
+        }
+      }
+
+      return friends.map((friend) => {
+        const player = playerMap.get(friend.steamid);
+        return {
+          ...friend,
+          personaname: player?.personaname,
+          avatar: player?.avatar,
+          personastate: player?.personastate,
+        };
+      });
+    }
+
+    return friends;
   }
 
   async resolveVanityUrl(vanityUrl: string): Promise<string | null> {
