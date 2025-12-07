@@ -1,3 +1,24 @@
+## v0.4.0 (2025-12-07)
+
+### Features
+
+- add wishlist and trade API endpoints
+- add batch app name fetching to wishlist endpoint
+- add friend names and status to get_friends_list
+- add game names to get_badges endpoint
+- add partner names to get_trade_offers endpoint
+- add partner names to get_trade_history endpoint
+
+### Bug Fixes
+
+- add fallback value to getTradeOffersSummary for consistency
+
+### Other Changes
+
+- Update src/steam-client.ts
+- Merge pull request #9 from sharkusmanch/claude/api-endpoint-wishlist-01APrNMhtzQGSkAobbXGt4HB
+
+
 ## v0.3.0 (2025-12-05)
 
 ### Bug Fixes
