@@ -1455,7 +1455,7 @@ server.tool(
 
 server.tool(
   "get_trade_history",
-  "Get completed trade history. Requires API key with trade permissions.",
+  "Get completed trade history with partner names. Requires API key with trade permissions.",
   {
     max_trades: z
       .number()
@@ -1469,13 +1469,33 @@ server.tool(
       .optional()
       .default(false)
       .describe("Include failed/rolled-back trades"),
+    include_partner_names: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include partner names (default: true)"),
   },
-  async ({ max_trades, include_failed }) => {
+  async ({ max_trades, include_failed, include_partner_names }) => {
     try {
       const history = await steam.getTradeHistory(max_trades, include_failed, true);
 
+      // Build partner name map if needed
+      let partnerNames = new Map<string, string>();
+      if (include_partner_names && history.trades.length > 0) {
+        const steamIds = [...new Set(history.trades.map((t) => t.steamid_other))];
+        // Batch in groups of 100 (API limit)
+        for (let i = 0; i < steamIds.length; i += 100) {
+          const batch = steamIds.slice(i, i + 100);
+          const summaries = await steam.getPlayerSummaries(batch);
+          for (const player of summaries) {
+            partnerNames.set(player.steamid, player.personaname);
+          }
+        }
+      }
+
       const trades = history.trades.map((trade) => ({
         trade_id: trade.tradeid,
+        partner_name: partnerNames.get(trade.steamid_other),
         partner_steam_id: trade.steamid_other,
         time: new Date(trade.time_init * 1000).toISOString(),
         status: trade.status,
