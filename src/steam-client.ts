@@ -678,7 +678,17 @@ export class SteamClient {
     }>("IEconService", "GetTradeOffersSummary", 1, {
       time_last_visit: Math.floor(Date.now() / 1000) - 86400, // Last 24 hours
     });
-    return data.response;
+    return data.response ?? {
+      pending_received_count: 0,
+      new_received_count: 0,
+      updated_received_count: 0,
+      historical_received_count: 0,
+      pending_sent_count: 0,
+      newly_accepted_sent_count: 0,
+      historical_sent_count: 0,
+      escrow_received_count: 0,
+      escrow_sent_count: 0,
+    };
   }
 
   async getTradeHistory(
