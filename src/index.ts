@@ -1147,19 +1147,25 @@ server.tool(
 
 server.tool(
   "get_wishlist",
-  "Get a player's Steam wishlist with game IDs, priorities, and dates added",
+  "Get a player's Steam wishlist with game names, priorities, and dates added",
   {
     steam_id: steamIdSchema,
+    include_names: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include game names (default: true)"),
   },
-  async ({ steam_id }) => {
+  async ({ steam_id, include_names }) => {
     try {
-      const wishlist = await steam.getWishlist(getSteamId(steam_id));
+      const wishlist = await steam.getWishlist(getSteamId(steam_id), include_names);
 
       // Sort by priority (lower priority number = higher on wishlist)
       const sorted = [...wishlist].sort((a, b) => a.priority - b.priority);
 
       const formatted = sorted.map((item) => ({
         appid: item.appid,
+        name: item.name,
         priority: item.priority,
         date_added: new Date(item.date_added * 1000).toISOString(),
       }));

@@ -240,6 +240,13 @@ export interface WishlistItem {
   appid: number;
   priority: number;
   date_added: number;
+  name?: string;
+}
+
+// App info from ICommunityService
+export interface AppInfo {
+  appid: number;
+  name: string;
 }
 
 // Trade types
@@ -633,15 +640,46 @@ export class SteamClient {
     return data.response;
   }
 
+  // === App Info Methods ===
+
+  async getAppNames(appIds: number[]): Promise<Map<number, string>> {
+    // Use ICommunityService/GetApps to batch fetch app info
+    const params: Record<string, string | number | boolean> = {};
+    appIds.forEach((appId, i) => {
+      params[`appids[${i}]`] = appId;
+    });
+
+    const data = await this.request<{
+      response: { apps: Array<{ appid: number; name: string }> };
+    }>("ICommunityService", "GetApps", 1, params);
+
+    const nameMap = new Map<number, string>();
+    for (const app of data.response?.apps ?? []) {
+      nameMap.set(app.appid, app.name);
+    }
+    return nameMap;
+  }
+
   // === Wishlist Methods ===
 
-  async getWishlist(steamId: string): Promise<WishlistItem[]> {
+  async getWishlist(steamId: string, includeNames = false): Promise<WishlistItem[]> {
     const data = await this.request<{
       response: { items: Array<{ appid: number; priority: number; date_added: number }> };
     }>("IWishlistService", "GetWishlist", 1, {
       steamid: steamId,
     });
-    return data.response?.items ?? [];
+    const items = data.response?.items ?? [];
+
+    if (includeNames && items.length > 0) {
+      const appIds = items.map((item) => item.appid);
+      const nameMap = await this.getAppNames(appIds);
+      return items.map((item) => ({
+        ...item,
+        name: nameMap.get(item.appid),
+      }));
+    }
+
+    return items;
   }
 
   async getWishlistItemCount(appId: number): Promise<number> {
