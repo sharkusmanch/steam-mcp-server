@@ -740,13 +740,29 @@ server.tool(
 
 server.tool(
   "get_badges",
-  "Get a player's Steam badges, XP, and level progression",
+  "Get a player's Steam badges with game names, XP, and level progression",
   {
     steam_id: steamIdSchema,
+    include_game_names: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include game names for game badges (default: true)"),
   },
-  async ({ steam_id }) => {
+  async ({ steam_id, include_game_names }) => {
     try {
-      const badges = await steam.getBadges(getSteamId(steam_id));
+      const badges = await steam.getBadges(getSteamId(steam_id), include_game_names);
+
+      const formattedBadges = badges.badges.map((b) => ({
+        badge_id: b.badgeid,
+        level: b.level,
+        xp: b.xp,
+        scarcity: b.scarcity,
+        completed: new Date(b.completion_time * 1000).toISOString(),
+        app_id: b.appid,
+        game_name: b.game_name,
+      }));
+
       return {
         content: [
           {
@@ -756,8 +772,8 @@ server.tool(
                 player_level: badges.player_level,
                 player_xp: badges.player_xp,
                 xp_needed_to_level_up: badges.player_xp_needed_to_level_up,
-                badge_count: badges.badges.length,
-                badges: badges.badges,
+                badge_count: formattedBadges.length,
+                badges: formattedBadges,
               },
               null,
               2

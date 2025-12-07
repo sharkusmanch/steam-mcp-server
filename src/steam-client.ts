@@ -140,6 +140,7 @@ export interface Badge {
   appid?: number;
   communityitemid?: string;
   border_color?: number;
+  game_name?: string;
 }
 
 export interface PlayerBadges {
@@ -526,13 +527,27 @@ export class SteamClient {
     return data.result?.items ?? [];
   }
 
-  async getBadges(steamId: string): Promise<PlayerBadges> {
+  async getBadges(steamId: string, includeGameNames = false): Promise<PlayerBadges> {
     const data = await this.request<{
       response: PlayerBadges;
     }>("IPlayerService", "GetBadges", 1, {
       steamid: steamId,
     });
-    return data.response;
+    const result = data.response;
+
+    if (includeGameNames && result.badges?.length > 0) {
+      // Get unique app IDs from badges that have them
+      const appIds = [...new Set(result.badges.filter((b) => b.appid).map((b) => b.appid!))] ;
+      if (appIds.length > 0) {
+        const nameMap = await this.getAppNames(appIds);
+        result.badges = result.badges.map((badge) => ({
+          ...badge,
+          game_name: badge.appid ? nameMap.get(badge.appid) : undefined,
+        }));
+      }
+    }
+
+    return result;
   }
 
   async getPlayerBans(steamIds: string[]): Promise<PlayerBan[]> {
