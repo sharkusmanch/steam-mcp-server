@@ -1,5 +1,12 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { SteamClient } from "./steam-client.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  SteamClient,
+  TimeoutError,
+  RateLimitError,
+  AuthError,
+  NotFoundError,
+  UpstreamError,
+} from "./steam-client.js";
 
 // Mock fetch globally
 const mockFetch = vi.fn();
@@ -287,6 +294,179 @@ describe("SteamClient", () => {
       expect(result.badges[0].game_name).toBeUndefined();
       // Only 1 fetch call (no getAppNames needed)
       expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("request reliability (timeout + retry + typed errors)", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("retries on a 500 then resolves the success payload", async () => {
+      vi.useFakeTimers();
+      mockFetch
+        .mockResolvedValueOnce({ ok: false, status: 500, statusText: "Server Error" })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ response: { players: [{ steamid: "1", personaname: "X" }] } }),
+        });
+
+      const p = client.getPlayerSummaries(["76561198000000000"]);
+      await vi.runAllTimersAsync();
+      const players = await p;
+
+      expect(players).toHaveLength(1);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("does NOT retry on a 404 and throws NotFoundError", async () => {
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 404, statusText: "Not Found" });
+
+      await expect(client.getPlayerSummaries(["76561198000000000"])).rejects.toBeInstanceOf(
+        NotFoundError
+      );
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT retry on an ok response (single attempt)", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ response: { players: [] } }),
+      });
+
+      await client.getPlayerSummaries(["76561198000000000"]);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("maps 401/403 to AuthError and 429 to RateLimitError", async () => {
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 401, statusText: "Unauthorized" });
+      await expect(client.getPlayerSummaries(["76561198000000000"])).rejects.toBeInstanceOf(
+        AuthError
+      );
+
+      // 429 is retriable: exhaust retries (3 attempts) then surface RateLimitError.
+      vi.useFakeTimers();
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue({ ok: false, status: 429, statusText: "Too Many" });
+      const p = client.getPlayerSummaries(["76561198000000000"]);
+      p.catch(() => {});
+      await vi.runAllTimersAsync();
+      await expect(p).rejects.toBeInstanceOf(RateLimitError);
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("throws UpstreamError when the body is not JSON", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => {
+          throw new SyntaxError("Unexpected token < in JSON");
+        },
+      });
+
+      await expect(client.getPlayerSummaries(["76561198000000000"])).rejects.toBeInstanceOf(
+        UpstreamError
+      );
+    });
+
+    it("aborts a hung request and surfaces TimeoutError", async () => {
+      vi.useFakeTimers();
+      mockFetch.mockImplementation(
+        (_url: string, init: { signal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => {
+              const err = new Error("aborted");
+              err.name = "AbortError";
+              reject(err);
+            });
+          })
+      );
+
+      const p = client.getPlayerSummaries(["76561198000000000"]);
+      p.catch(() => {});
+      await vi.runAllTimersAsync();
+      await expect(p).rejects.toBeInstanceOf(TimeoutError);
+    });
+  });
+
+  describe("getInventory", () => {
+    it("maps a 403 to the 'Inventory is private' message", async () => {
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" });
+
+      await expect(client.getInventory("76561198000000000", 730)).rejects.toThrow(
+        "Inventory is private"
+      );
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("threads start_assetid into the request URL as a cursor", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ assets: [], descriptions: [], total_inventory_count: 0, success: 1 }),
+      });
+
+      await client.getInventory("76561198000000000", 730, 2, 50, "12345");
+
+      const calledUrl = mockFetch.mock.calls[0][0] as string;
+      expect(calledUrl).toContain("start_assetid=12345");
+    });
+  });
+
+  describe("searchStore", () => {
+    it("returns only type='app' rows with numeric appids", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          total: 3,
+          items: [
+            { id: "440", name: "Team Fortress 2", type: "app", tiny_image: "x" },
+            { id: 232250, name: "TF2 Bundle", type: "bundle" },
+            { id: "570", name: "Dota 2", type: "app" },
+          ],
+        }),
+      });
+
+      const result = await client.searchStore("tf");
+
+      expect(result.apps).toHaveLength(2);
+      expect(result.apps[0]).toMatchObject({ appid: 440, name: "Team Fortress 2", type: "app" });
+      expect(typeof result.apps[0].appid).toBe("number");
+      expect(result.apps[1].appid).toBe(570);
+      // store_total surfaces Steam's (capped) reported total.
+      expect(result.store_total).toBe(3);
+      // Bundle row must be filtered out so its package id never leaks as an appid.
+      expect(result.apps.some((r) => r.name === "TF2 Bundle")).toBe(false);
+    });
+
+    it("does not append an API key and hits the storefront endpoint", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ total: 0, items: [] }),
+      });
+
+      await client.searchStore("nothing");
+
+      const calledUrl = mockFetch.mock.calls[0][0] as string;
+      expect(calledUrl).toContain("store.steampowered.com/api/storesearch/");
+      expect(calledUrl).toContain("term=nothing");
+      expect(calledUrl).not.toContain("key=");
+    });
+
+    it("retries once on a transient 500 then succeeds", async () => {
+      vi.useFakeTimers();
+      mockFetch
+        .mockResolvedValueOnce({ ok: false, status: 500, statusText: "Server Error" })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ total: 1, items: [{ id: "1", name: "A", type: "app" }] }),
+        });
+
+      const p = client.searchStore("a");
+      await vi.runAllTimersAsync();
+      const result = await p;
+
+      expect(result.apps).toHaveLength(1);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      vi.useRealTimers();
     });
   });
 });

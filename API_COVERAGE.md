@@ -41,7 +41,7 @@ This document details which Steam Web API endpoints are implemented in this MCP 
 ### ISteamApps
 | Method | Tool | Notes |
 |--------|------|-------|
-| GetAppList | `search_apps` | Search Steam catalog |
+| storesearch (storefront) | `search_apps` | Relevance-ranked app name search |
 | GetServersAtAddress | `get_servers_at_address` | Game servers at IP |
 | UpToDateCheck | `check_app_update` | Version update check |
 

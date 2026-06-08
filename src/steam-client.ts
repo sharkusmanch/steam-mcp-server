@@ -1,5 +1,78 @@
 const STEAM_API_BASE = "https://api.steampowered.com";
 
+// Reliability tuning. STEAM_HTTP_TIMEOUT_MS can override the default per-request timeout.
+const DEFAULT_TIMEOUT_MS = Number(process.env.STEAM_HTTP_TIMEOUT_MS) || 10000;
+const DEFAULT_RETRIES = 2;
+const MAX_BACKOFF_MS = 2000;
+const MAX_RETRY_AFTER_MS = 5000;
+
+// Typed errors. Messages are kept short and free of URLs/paths so that
+// sanitizeErrorMessage() (in index.ts) does not collapse them to a generic string.
+export class TimeoutError extends Error {
+  constructor(message = "Request timed out") {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
+export class RateLimitError extends Error {
+  retryAfterMs?: number;
+  constructor(retryAfterMs?: number) {
+    super("Rate limited by Steam");
+    this.name = "RateLimitError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export class AuthError extends Error {
+  constructor(message = "Steam authentication failed") {
+    super(message);
+    this.name = "AuthError";
+  }
+}
+
+export class NotFoundError extends Error {
+  constructor(message = "Resource not found") {
+    super(message);
+    this.name = "NotFoundError";
+  }
+}
+
+export class UpstreamError extends Error {
+  status?: number;
+  constructor(status?: number, message = "Steam service error") {
+    super(message);
+    this.name = "UpstreamError";
+    this.status = status;
+  }
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// Exponential backoff with jitter, capped.
+function backoffMs(attempt: number): number {
+  return Math.min(250 * 2 ** attempt + Math.random() * 100, MAX_BACKOFF_MS);
+}
+
+// Read Retry-After (seconds) defensively — test mocks have no headers object.
+function parseRetryAfter(response: Response): number | undefined {
+  const ra = response.headers?.get?.("retry-after");
+  if (!ra) return undefined;
+  const secs = Number(ra);
+  if (!Number.isNaN(secs)) return Math.min(secs * 1000, MAX_RETRY_AFTER_MS);
+  return undefined;
+}
+
+// Map a non-ok HTTP status to a typed error.
+function errorForStatus(response: Response): Error {
+  const status = response.status;
+  if (status === 401 || status === 403) return new AuthError();
+  if (status === 404) return new NotFoundError();
+  if (status === 429) return new RateLimitError(parseRetryAfter(response));
+  return new UpstreamError(status);
+}
+
 export interface SteamClientConfig {
   apiKey: string;
 }
@@ -117,6 +190,9 @@ export interface InventoryResponse {
   descriptions: InventoryDescription[];
   total_inventory_count: number;
   success: number;
+  // Steam-native cursor: present (with more_items) when more pages exist.
+  last_assetid?: string;
+  more_items?: number;
 }
 
 export interface EconItem {
@@ -217,6 +293,29 @@ export interface GlobalStat {
 export interface SteamApp {
   appid: number;
   name: string;
+}
+
+export interface StoreSearchResult {
+  appid: number;
+  name: string;
+  type: string;
+  tiny_image?: string;
+  price?: unknown;
+  platforms?: unknown;
+  metascore?: string;
+  controller_support?: string;
+}
+
+// Raw row shape returned by the storefront search endpoint.
+interface StoreSearchRow {
+  id: number | string;
+  name: string;
+  type?: string;
+  tiny_image?: string;
+  price?: unknown;
+  platforms?: unknown;
+  metascore?: string;
+  controller_support?: string;
 }
 
 export interface GameServer {
@@ -320,11 +419,76 @@ export class SteamClient {
     this.apiKey = config.apiKey;
   }
 
+  // One fetch + JSON parse under a single AbortController timeout. The timer is
+  // only cleared after the body is consumed, so a server that sends headers and
+  // then stalls the body stream is aborted too (fetch() resolves on headers).
+  // Returns the parsed body for ok responses; returns the Response (body unread)
+  // for non-ok so the retry layer can classify it.
+  private async attemptJson<T>(
+    url: string,
+    timeoutMs: number,
+    init: RequestInit
+  ): Promise<{ ok: true; data: T } | { ok: false; response: Response }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...init, signal: controller.signal });
+      if (!response.ok) {
+        return { ok: false, response };
+      }
+      const data = (await response.json()) as T;
+      return { ok: true, data };
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new TimeoutError();
+      }
+      if (err instanceof SyntaxError) {
+        throw new UpstreamError(undefined, "Steam returned a non-JSON response");
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Fetch + parse JSON with bounded retry. Retries only on transient failures:
+  // thrown timeout/network errors, HTTP 429, or 5xx. Never retries ok responses
+  // or non-transient 4xx. The timeout covers the body read, not just headers.
+  private async fetchJson<T>(
+    url: string,
+    opts: { timeoutMs?: number; retries?: number; init?: RequestInit } = {}
+  ): Promise<T> {
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const retries = opts.retries ?? DEFAULT_RETRIES;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const result = await this.attemptJson<T>(url, timeoutMs, opts.init ?? {});
+        if (result.ok) return result.data;
+        const status = result.response.status;
+        const retriable = status === 429 || status >= 500;
+        if (retriable && attempt < retries) {
+          await sleep(parseRetryAfter(result.response) ?? backoffMs(attempt));
+          continue;
+        }
+        throw errorForStatus(result.response);
+      } catch (err) {
+        // Retry transient timeout/network errors; surface typed/non-transient errors.
+        const transient = err instanceof TimeoutError || err instanceof TypeError;
+        if (transient && attempt < retries) {
+          await sleep(backoffMs(attempt));
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
   private async request<T>(
     iface: string,
     method: string,
     version: number,
-    params: Record<string, string | number | boolean> = {}
+    params: Record<string, string | number | boolean> = {},
+    opts: { timeoutMs?: number; retries?: number } = {}
   ): Promise<T> {
     const url = new URL(`${STEAM_API_BASE}/${iface}/${method}/v${version}/`);
     url.searchParams.set("key", this.apiKey);
@@ -334,13 +498,7 @@ export class SteamClient {
       url.searchParams.set(key, String(value));
     }
 
-    const response = await fetch(url.toString());
-
-    if (!response.ok) {
-      throw new Error(`Steam API error: ${response.status} ${response.statusText}`);
-    }
-
-    return response.json() as Promise<T>;
+    return this.fetchJson<T>(url.toString(), opts);
   }
 
   async getPlayerSummaries(steamIds: string[]): Promise<PlayerSummary[]> {
@@ -466,16 +624,9 @@ export class SteamClient {
 
   async getAppDetails(appId: number): Promise<Record<string, unknown> | null> {
     const url = `https://store.steampowered.com/api/appdetails?appids=${appId}`;
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(`Steam Store API error: ${response.status}`);
-    }
-
-    const data = (await response.json()) as Record<
-      string,
-      { success: boolean; data: Record<string, unknown> }
-    >;
+    const data = await this.fetchJson<
+      Record<string, { success: boolean; data: Record<string, unknown> }>
+    >(url);
     const appData = data[String(appId)];
 
     return appData?.success ? appData.data : null;
@@ -485,19 +636,21 @@ export class SteamClient {
     steamId: string,
     appId: number,
     contextId = 2,
-    count = 75
+    count = 75,
+    startAssetid?: string
   ): Promise<InventoryResponse> {
-    const url = `https://steamcommunity.com/inventory/${steamId}/${appId}/${contextId}?l=english&count=${count}`;
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      if (response.status === 403) {
+    const url = `https://steamcommunity.com/inventory/${steamId}/${appId}/${contextId}?l=english&count=${count}${
+      startAssetid ? `&start_assetid=${startAssetid}` : ""
+    }`;
+    try {
+      return await this.fetchJson<InventoryResponse>(url);
+    } catch (err) {
+      // The inventory endpoint returns 403 (mapped to AuthError) for private inventories.
+      if (err instanceof AuthError) {
         throw new Error("Inventory is private");
       }
-      throw new Error(`Steam inventory error: ${response.status}`);
+      throw err;
     }
-
-    return response.json() as Promise<InventoryResponse>;
   }
 
   async getTF2Items(steamId: string): Promise<EconItem[]> {
@@ -659,11 +812,39 @@ export class SteamClient {
     return stats;
   }
 
-  async getAppList(): Promise<SteamApp[]> {
-    const data = await this.request<{
-      applist: { apps: SteamApp[] };
-    }>("ISteamApps", "GetAppList", 2, {});
-    return data.applist?.apps ?? [];
+  // Relevance-ranked app search via the storefront search endpoint. Takes no API
+  // key and returns a small ranked list, so it replaces the multi-MB GetAppList
+  // catalog scan. Only rows of type "app" are returned (bundle/sub rows carry a
+  // package id, not an appid).
+  async searchStore(
+    term: string,
+    cc = "us",
+    l = "english"
+  ): Promise<{ store_total: number; apps: StoreSearchResult[] }> {
+    const url = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(
+      term
+    )}&cc=${encodeURIComponent(cc)}&l=${encodeURIComponent(l)}`;
+    // The store host throttles harder than the Web API, so retry less.
+    const data = await this.fetchJson<{ total?: number; items?: StoreSearchRow[] }>(
+      url,
+      { retries: 1 }
+    );
+    const items = data.items ?? [];
+    const apps = items
+      .filter((item) => item.type === "app")
+      .map((item) => ({
+        appid: Number(item.id),
+        name: String(item.name),
+        type: item.type as string,
+        tiny_image: item.tiny_image,
+        price: item.price,
+        platforms: item.platforms,
+        controller_support: item.controller_support,
+        metascore: item.metascore,
+      }));
+    // storesearch caps its list (~10) and reports a likewise-capped `total`; expose
+    // it as store_total so the caller can signal that results are top-ranked, not exhaustive.
+    return { store_total: data.total ?? apps.length, apps };
   }
 
   async getServersAtAddress(addr: string): Promise<GameServer[]> {

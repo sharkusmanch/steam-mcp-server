@@ -3,7 +3,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { SteamClient } from "./steam-client.js";
+import {
+  SteamClient,
+  TimeoutError,
+  RateLimitError,
+  AuthError,
+  NotFoundError,
+  UpstreamError,
+} from "./steam-client.js";
 
 const apiKey = process.env.STEAM_API_KEY;
 const defaultSteamId = process.env.STEAM_ID;
@@ -88,6 +95,22 @@ function isValidServerAddress(address: string): boolean {
 
 // Security: Sanitize error messages to avoid information disclosure
 function sanitizeErrorMessage(error: unknown): string {
+  // Typed errors from the client carry a known, safe, actionable message.
+  if (error instanceof TimeoutError) {
+    return "Steam API timed out. This is usually transient — please try again.";
+  }
+  if (error instanceof RateLimitError) {
+    return "Rate limited by Steam. This is transient — please wait a moment and try again.";
+  }
+  if (error instanceof AuthError) {
+    return "Authorization error: Check API key or profile privacy settings";
+  }
+  if (error instanceof NotFoundError) {
+    return "Not found: The requested resource does not exist";
+  }
+  if (error instanceof UpstreamError) {
+    return "Steam API temporarily unavailable. Please try again later";
+  }
   if (error instanceof Error) {
     // Remove potentially sensitive information from error messages
     const message = error.message;
@@ -142,23 +165,75 @@ function accountIdToSteamId(accountId: number): string {
   return (STEAM_ID_BASE + BigInt(accountId)).toString();
 }
 
-// Security: Cache for app list to prevent resource exhaustion
-// Refreshes every 24 hours
-interface AppListCache {
-  apps: Array<{ appid: number; name: string }>;
-  timestamp: number;
+// Pagination: apply offset/limit to an array and report pre-slice totals so the
+// model can decide whether to keep paging. `has_more` is true when more items
+// remain after the returned page.
+interface Page<T> {
+  page: T[];
+  total: number;
+  returned: number;
+  offset: number;
+  has_more: boolean;
 }
-let appListCache: AppListCache | null = null;
-const APP_LIST_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+function paginate<T>(items: T[], offset: number, limit: number): Page<T> {
+  const total = items.length;
+  const page = items.slice(offset, offset + limit);
+  return {
+    page,
+    total,
+    returned: page.length,
+    offset,
+    has_more: offset + page.length < total,
+  };
+}
 
-async function getCachedAppList(): Promise<Array<{ appid: number; name: string }>> {
-  const now = Date.now();
-  if (appListCache && (now - appListCache.timestamp) < APP_LIST_CACHE_TTL) {
-    return appListCache.apps;
-  }
-  const apps = await steam.getAppList();
-  appListCache = { apps, timestamp: now };
-  return apps;
+// Zod fragments shared by all paginated tools for a consistent convention.
+const offsetSchema = z
+  .number()
+  .int()
+  .min(0)
+  .optional()
+  .default(0)
+  .describe("Number of items to skip for pagination");
+function limitSchema(def: number, max = 200) {
+  return z
+    .number()
+    .int()
+    .min(1)
+    .max(max)
+    .optional()
+    .default(def)
+    .describe(`Max items to return (default ${def}, max ${max})`);
+}
+
+// MCP text-content result shape returned by every tool handler.
+type ToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+};
+
+// Wrap a tool handler so any thrown error becomes a sanitized isError result
+// instead of crashing the handler / leaking internals.
+function withErrorHandling<A extends unknown[]>(
+  fn: (...args: A) => Promise<ToolResult>
+): (...args: A) => Promise<ToolResult> {
+  return async (...args: A): Promise<ToolResult> => {
+    try {
+      return await fn(...args);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: sanitizeErrorMessage(error) }],
+        isError: true,
+      };
+    }
+  };
+}
+
+// Helper to emit a JSON text result.
+function jsonResult(data: unknown): ToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+  };
 }
 
 // Helper for parallel processing with concurrency limit
@@ -206,7 +281,7 @@ server.tool(
   {
     steam_id: steamIdSchema,
   },
-  async ({ steam_id }) => {
+  withErrorHandling(async ({ steam_id }) => {
     const players = await steam.getPlayerSummaries([getSteamId(steam_id)]);
     if (players.length === 0) {
       return { content: [{ type: "text", text: "Player not found" }] };
@@ -214,12 +289,12 @@ server.tool(
     return {
       content: [{ type: "text", text: JSON.stringify(players[0], null, 2) }],
     };
-  }
+  })
 );
 
 server.tool(
   "get_friends_list",
-  "Get a player's Steam friends list with names and relationship info",
+  "Get a player's Steam friends list with names and relationship info. Use offset/limit to page through large lists.",
   {
     steam_id: steamIdSchema,
     include_info: z
@@ -227,42 +302,29 @@ server.tool(
       .optional()
       .default(true)
       .describe("Include friend names and online status (default: true)"),
+    limit: limitSchema(100),
+    offset: offsetSchema,
   },
-  async ({ steam_id, include_info }) => {
-    try {
-      const friends = await steam.getFriendList(getSteamId(steam_id), include_info);
+  withErrorHandling(async ({ steam_id, include_info, limit, offset }) => {
+    const friends = await steam.getFriendList(getSteamId(steam_id), include_info);
 
-      const formatted = friends.map((f) => ({
-        steam_id: f.steamid,
-        name: f.personaname,
-        relationship: f.relationship,
-        friend_since: new Date(f.friend_since * 1000).toISOString(),
-        status: f.personastate !== undefined ? getPersonaState(f.personastate) : undefined,
-      }));
+    const formatted = friends.map((f) => ({
+      steam_id: f.steamid,
+      name: f.personaname,
+      relationship: f.relationship,
+      friend_since: new Date(f.friend_since * 1000).toISOString(),
+      status: f.personastate !== undefined ? getPersonaState(f.personastate) : undefined,
+    }));
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { friend_count: formatted.length, friends: formatted },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch friends list: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+    const { page, total, returned, has_more } = paginate(formatted, offset, limit);
+    return jsonResult({
+      friend_count: total,
+      returned,
+      offset,
+      has_more,
+      friends: page,
+    });
+  })
 );
 
 server.tool(
@@ -271,12 +333,12 @@ server.tool(
   {
     steam_id: steamIdSchema,
   },
-  async ({ steam_id }) => {
+  withErrorHandling(async ({ steam_id }) => {
     const level = await steam.getSteamLevel(getSteamId(steam_id));
     return {
       content: [{ type: "text", text: JSON.stringify({ steam_level: level }) }],
     };
-  }
+  })
 );
 
 server.tool(
@@ -289,7 +351,7 @@ server.tool(
       .max(32)
       .describe("The vanity URL part (e.g., 'gaben' from steamcommunity.com/id/gaben)"),
   },
-  async ({ vanity_url }) => {
+  withErrorHandling(async ({ vanity_url }) => {
     // Security: Validate vanity URL format
     if (!isValidVanityUrl(vanity_url)) {
       return {
@@ -303,7 +365,7 @@ server.tool(
     return {
       content: [{ type: "text", text: JSON.stringify({ steam_id: steamId }) }],
     };
-  }
+  })
 );
 
 // === Library Tools ===
@@ -320,21 +382,20 @@ server.tool(
       .describe("Include free-to-play games"),
     limit: z
       .number()
+      .int()
+      .min(1)
+      .max(200)
       .optional()
-      .describe("Max games to return (default: all)"),
-    offset: z
-      .number()
-      .optional()
-      .default(0)
-      .describe("Number of games to skip for pagination"),
+      .describe("Max games to return (default: all, max 200)"),
+    offset: offsetSchema,
     sort_by: z
       .enum(["playtime", "name", "recent"])
       .optional()
       .default("playtime")
       .describe("Sort order: playtime (desc), name (asc), or recent (by 2-week playtime)"),
   },
-  async ({ steam_id, include_free_games, limit, offset, sort_by }) => {
-    let games = await steam.getOwnedGames(getSteamId(steam_id), true, include_free_games);
+  withErrorHandling(async ({ steam_id, include_free_games, limit, offset, sort_by }) => {
+    const games = await steam.getOwnedGames(getSteamId(steam_id), true, include_free_games);
 
     // Sort
     if (sort_by === "name") {
@@ -346,24 +407,15 @@ server.tool(
     }
 
     const total = games.length;
-
-    // Paginate
-    if (offset > 0) games = games.slice(offset);
-    if (limit) games = games.slice(0, limit);
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            { total_games: total, returned: games.length, offset, games },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
+    const sliced = games.slice(offset, limit ? offset + limit : undefined);
+    return jsonResult({
+      total_games: total,
+      returned: sliced.length,
+      offset,
+      has_more: offset + sliced.length < total,
+      games: sliced,
+    });
+  })
 );
 
 server.tool(
@@ -373,16 +425,17 @@ server.tool(
     steam_id: steamIdSchema,
     count: z
       .number()
+      .int()
+      .min(1)
+      .max(50)
       .optional()
       .default(10)
-      .describe("Maximum number of games to return"),
+      .describe("Maximum number of games to return (default 10, max 50)"),
   },
-  async ({ steam_id, count }) => {
+  withErrorHandling(async ({ steam_id, count }) => {
     const games = await steam.getRecentlyPlayedGames(getSteamId(steam_id), count);
-    return {
-      content: [{ type: "text", text: JSON.stringify(games, null, 2) }],
-    };
-  }
+    return jsonResult({ count: games.length, games });
+  })
 );
 
 server.tool(
@@ -391,7 +444,7 @@ server.tool(
   {
     app_id: z.number().describe("Steam application ID"),
   },
-  async ({ app_id }) => {
+  withErrorHandling(async ({ app_id }) => {
     const details = await steam.getAppDetails(app_id);
     if (!details) {
       return { content: [{ type: "text", text: "Game not found" }] };
@@ -399,35 +452,38 @@ server.tool(
     return {
       content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
     };
-  }
+  })
 );
 
 // === Achievement & Stats Tools ===
 
 server.tool(
   "get_achievements",
-  "Get a player's achievements for a specific game",
+  "Get a player's achievements for a specific game. Use offset/limit to page through games with many achievements.",
   {
     steam_id: steamIdSchema,
-    app_id: z.number().describe("Steam application ID"),
+    app_id: z.number().int().positive().describe("Steam application ID"),
+    limit: limitSchema(50),
+    offset: offsetSchema,
   },
-  async ({ steam_id, app_id }) => {
-    try {
-      const achievements = await steam.getPlayerAchievements(getSteamId(steam_id), app_id);
-      return {
-        content: [{ type: "text", text: JSON.stringify(achievements, null, 2) }],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch achievements: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ steam_id, app_id, limit, offset }) => {
+    const result = await steam.getPlayerAchievements(getSteamId(steam_id), app_id);
+    const { page, total, returned, has_more } = paginate(
+      result.achievements ?? [],
+      offset,
+      limit
+    );
+    return jsonResult({
+      steamID: result.steamID,
+      gameName: result.gameName,
+      success: result.success,
+      achievement_count: total,
+      returned,
+      offset,
+      has_more,
+      achievements: page,
+    });
+  })
 );
 
 server.tool(
@@ -437,23 +493,12 @@ server.tool(
     steam_id: steamIdSchema,
     app_id: z.number().describe("Steam application ID"),
   },
-  async ({ steam_id, app_id }) => {
-    try {
-      const stats = await steam.getUserStatsForGame(getSteamId(steam_id), app_id);
-      return {
-        content: [{ type: "text", text: JSON.stringify(stats, null, 2) }],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch stats: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ steam_id, app_id }) => {
+    const stats = await steam.getUserStatsForGame(getSteamId(steam_id), app_id);
+    return {
+      content: [{ type: "text", text: JSON.stringify(stats, null, 2) }],
+    };
+  })
 );
 
 server.tool(
@@ -462,28 +507,39 @@ server.tool(
   {
     app_id: z.number().describe("Steam application ID"),
   },
-  async ({ app_id }) => {
+  withErrorHandling(async ({ app_id }) => {
     const achievements = await steam.getGlobalAchievementPercentages(app_id);
     return {
       content: [{ type: "text", text: JSON.stringify(achievements, null, 2) }],
     };
-  }
+  })
 );
 
 server.tool(
   "get_perfect_games",
-  "Get games where the player has unlocked ALL achievements (100% completion)",
+  "Get games where the player has unlocked ALL achievements (100% completion). Scans the library (bounded by max_games); use offset/limit to page the results.",
   {
     steam_id: steamIdSchema,
+    max_games: z
+      .number()
+      .int()
+      .min(1)
+      .max(1000)
+      .optional()
+      .default(500)
+      .describe("Max games to scan for achievements (default 500, max 1000)"),
+    limit: limitSchema(50),
+    offset: offsetSchema,
   },
-  async ({ steam_id }) => {
+  withErrorHandling(async ({ steam_id, max_games, limit, offset }) => {
     const id = getSteamId(steam_id);
     const games = await steam.getOwnedGames(id, true, true);
 
-    // Filter to games that have achievements AND have been played
-    const gamesWithAchievements = games.filter(
-      (g) => g.has_community_visible_stats && g.playtime_forever > 0
-    );
+    // Filter to games that have achievements AND have been played, then cap the
+    // scan to bound the number of upstream calls.
+    const gamesWithAchievements = games
+      .filter((g) => g.has_community_visible_stats && g.playtime_forever > 0)
+      .slice(0, max_games);
 
     // Process in parallel with concurrency limit of 10
     const perfectGames = await parallelMap(
@@ -514,19 +570,15 @@ server.tool(
     // Sort by achievement count descending
     perfectGames.sort((a, b) => b.achievement_count - a.achievement_count);
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            { perfect_game_count: perfectGames.length, games: perfectGames },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
+    const { page, total, returned, has_more } = paginate(perfectGames, offset, limit);
+    return jsonResult({
+      perfect_game_count: total,
+      returned,
+      offset,
+      has_more,
+      games: page,
+    });
+  })
 );
 
 server.tool(
@@ -535,11 +587,14 @@ server.tool(
   {
     steam_id: steamIdSchema,
     app_ids: z
-      .array(z.number())
+      .array(z.number().int().positive())
+      .max(50)
       .optional()
-      .describe("Specific app IDs to check (if omitted, checks recently played games)"),
+      .describe("Specific app IDs to check, max 50 (if omitted, checks recently played games)"),
+    limit: limitSchema(50),
+    offset: offsetSchema,
   },
-  async ({ steam_id, app_ids }) => {
+  withErrorHandling(async ({ steam_id, app_ids, limit, offset }) => {
     const id = getSteamId(steam_id);
 
     let gamesToCheck: Array<{ appid: number; name?: string }>;
@@ -577,169 +632,132 @@ server.tool(
       10
     );
 
-    return {
-      content: [{ type: "text", text: JSON.stringify(summaries, null, 2) }],
-    };
-  }
+    const { page, total, returned, has_more } = paginate(summaries, offset, limit);
+    return jsonResult({
+      game_count: total,
+      returned,
+      offset,
+      has_more,
+      summaries: page,
+    });
+  })
 );
 
 // === Inventory Tools ===
 
 server.tool(
   "get_inventory",
-  "Get a player's inventory for any game (requires public profile)",
+  "Get a player's inventory for any game (requires public profile). Pass next_cursor from a previous call as start_assetid to fetch the next page.",
   {
     steam_id: steamIdSchema,
-    app_id: z.number().describe("Steam application ID (e.g., 753 for Steam, 730 for CS2)"),
+    app_id: z.number().int().positive().describe("Steam application ID (e.g., 753 for Steam, 730 for CS2)"),
     context_id: z
       .number()
+      .int()
+      .min(0)
       .optional()
       .default(2)
       .describe("Context ID (usually 2 for most games, 6 for Steam community items)"),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(500)
+      .optional()
+      .default(50)
+      .describe("Max items to fetch per page (default 50, max 500)"),
     count: z
       .number()
+      .int()
+      .min(1)
+      .max(500)
       .optional()
-      .default(75)
-      .describe("Max items to return (default 75, max 5000)"),
+      .describe("Deprecated alias for limit (kept for backward compatibility)"),
+    start_assetid: z
+      .string()
+      .optional()
+      .describe("Steam-native cursor: pass next_cursor from a previous page to continue"),
   },
-  async ({ steam_id, app_id, context_id, count }) => {
-    try {
-      const inventory = await steam.getInventory(
-        getSteamId(steam_id),
-        app_id,
-        context_id,
-        Math.min(count, 5000)
+  withErrorHandling(async ({ steam_id, app_id, context_id, limit, count, start_assetid }) => {
+    // The Steam inventory endpoint is cursor-based (start_assetid), not offset-based.
+    const effective = limit ?? count ?? 50;
+    const inventory = await steam.getInventory(
+      getSteamId(steam_id),
+      app_id,
+      context_id,
+      effective,
+      start_assetid
+    );
+
+    // Merge assets with descriptions for easier consumption
+    const items = inventory.assets.map((asset) => {
+      const desc = inventory.descriptions.find(
+        (d) => d.classid === asset.classid && d.instanceid === asset.instanceid
       );
-
-      // Merge assets with descriptions for easier consumption
-      const items = inventory.assets.map((asset) => {
-        const desc = inventory.descriptions.find(
-          (d) => d.classid === asset.classid && d.instanceid === asset.instanceid
-        );
-        return {
-          assetid: asset.assetid,
-          amount: asset.amount,
-          name: desc?.name,
-          type: desc?.type,
-          tradable: desc?.tradable === 1,
-          marketable: desc?.marketable === 1,
-          tags: desc?.tags?.map((t) => t.localized_tag_name),
-        };
-      });
-
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { total: inventory.total_inventory_count, returned: items.length, items },
-              null,
-              2
-            ),
-          },
-        ],
+        assetid: asset.assetid,
+        amount: asset.amount,
+        name: desc?.name,
+        type: desc?.type,
+        tradable: desc?.tradable === 1,
+        marketable: desc?.marketable === 1,
+        tags: desc?.tags?.map((t) => t.localized_tag_name),
       };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch inventory: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+    });
+
+    return jsonResult({
+      total: inventory.total_inventory_count,
+      returned: items.length,
+      has_more: Boolean(inventory.more_items),
+      next_cursor: inventory.more_items ? inventory.last_assetid : undefined,
+      items,
+    });
+  })
 );
 
 server.tool(
   "get_tf2_inventory",
-  "Get a player's Team Fortress 2 inventory (via official API)",
+  "Get a player's Team Fortress 2 inventory (via official API). Use offset/limit to page.",
   {
     steam_id: steamIdSchema,
+    limit: limitSchema(50, 500),
+    offset: offsetSchema,
   },
-  async ({ steam_id }) => {
-    try {
-      const items = await steam.getTF2Items(getSteamId(steam_id));
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ item_count: items.length, items }, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch TF2 inventory: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ steam_id, limit, offset }) => {
+    const all = await steam.getTF2Items(getSteamId(steam_id));
+    const { page, total, returned, has_more } = paginate(all, offset, limit);
+    return jsonResult({ item_count: total, returned, offset, has_more, items: page });
+  })
 );
 
 server.tool(
   "get_csgo_inventory",
-  "Get a player's CS2/CSGO inventory (via official API)",
+  "Get a player's CS2/CSGO inventory (via official API). Use offset/limit to page.",
   {
     steam_id: steamIdSchema,
+    limit: limitSchema(50, 500),
+    offset: offsetSchema,
   },
-  async ({ steam_id }) => {
-    try {
-      const items = await steam.getCSGOItems(getSteamId(steam_id));
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ item_count: items.length, items }, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch CS2 inventory: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ steam_id, limit, offset }) => {
+    const all = await steam.getCSGOItems(getSteamId(steam_id));
+    const { page, total, returned, has_more } = paginate(all, offset, limit);
+    return jsonResult({ item_count: total, returned, offset, has_more, items: page });
+  })
 );
 
 server.tool(
   "get_dota2_inventory",
-  "Get a player's Dota 2 inventory (via official API)",
+  "Get a player's Dota 2 inventory (via official API). Use offset/limit to page.",
   {
     steam_id: steamIdSchema,
+    limit: limitSchema(50, 500),
+    offset: offsetSchema,
   },
-  async ({ steam_id }) => {
-    try {
-      const items = await steam.getDota2Items(getSteamId(steam_id));
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ item_count: items.length, items }, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch Dota 2 inventory: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ steam_id, limit, offset }) => {
+    const all = await steam.getDota2Items(getSteamId(steam_id));
+    const { page, total, returned, has_more } = paginate(all, offset, limit);
+    return jsonResult({ item_count: total, returned, offset, has_more, items: page });
+  })
 );
 
 // === Badge & Profile Tools ===
@@ -754,50 +772,34 @@ server.tool(
       .optional()
       .default(true)
       .describe("Include game names for game badges (default: true)"),
+    limit: limitSchema(50),
+    offset: offsetSchema,
   },
-  async ({ steam_id, include_game_names }) => {
-    try {
-      const badges = await steam.getBadges(getSteamId(steam_id), include_game_names);
+  withErrorHandling(async ({ steam_id, include_game_names, limit, offset }) => {
+    const badges = await steam.getBadges(getSteamId(steam_id), include_game_names);
 
-      const formattedBadges = badges.badges.map((b) => ({
-        badge_id: b.badgeid,
-        level: b.level,
-        xp: b.xp,
-        scarcity: b.scarcity,
-        completed: new Date(b.completion_time * 1000).toISOString(),
-        app_id: b.appid,
-        game_name: b.game_name,
-      }));
+    const formattedBadges = badges.badges.map((b) => ({
+      badge_id: b.badgeid,
+      level: b.level,
+      xp: b.xp,
+      scarcity: b.scarcity,
+      completed: new Date(b.completion_time * 1000).toISOString(),
+      app_id: b.appid,
+      game_name: b.game_name,
+    }));
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                player_level: badges.player_level,
-                player_xp: badges.player_xp,
-                xp_needed_to_level_up: badges.player_xp_needed_to_level_up,
-                badge_count: formattedBadges.length,
-                badges: formattedBadges,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch badges: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+    const { page, total, returned, has_more } = paginate(formattedBadges, offset, limit);
+    return jsonResult({
+      player_level: badges.player_level,
+      player_xp: badges.player_xp,
+      xp_needed_to_level_up: badges.player_xp_needed_to_level_up,
+      badge_count: total,
+      returned,
+      offset,
+      has_more,
+      badges: page,
+    });
+  })
 );
 
 server.tool(
@@ -806,7 +808,7 @@ server.tool(
   {
     steam_id: steamIdSchema,
   },
-  async ({ steam_id }) => {
+  withErrorHandling(async ({ steam_id }) => {
     const bans = await steam.getPlayerBans([getSteamId(steam_id)]);
     if (bans.length === 0) {
       return { content: [{ type: "text", text: "Player not found" }] };
@@ -832,7 +834,7 @@ server.tool(
         },
       ],
     };
-  }
+  })
 );
 
 // === Game Info Tools ===
@@ -841,19 +843,25 @@ server.tool(
   "get_game_news",
   "Get latest news and patch notes for a game",
   {
-    app_id: z.number().describe("Steam application ID"),
+    app_id: z.number().int().positive().describe("Steam application ID"),
     count: z
       .number()
+      .int()
+      .min(1)
+      .max(50)
       .optional()
       .default(5)
-      .describe("Number of news items to return (default 5)"),
+      .describe("Number of news items to return (default 5, max 50)"),
     max_length: z
       .number()
+      .int()
+      .min(0)
+      .max(10000)
       .optional()
       .default(1000)
       .describe("Max length of content (default 1000, 0 for full content)"),
   },
-  async ({ app_id, count, max_length }) => {
+  withErrorHandling(async ({ app_id, count, max_length }) => {
     const news = await steam.getNewsForApp(app_id, count, max_length);
     const formatted = news.map((item) => ({
       title: item.title,
@@ -863,117 +871,64 @@ server.tool(
       content: item.contents,
       feed: item.feedlabel,
     }));
-    return {
-      content: [{ type: "text", text: JSON.stringify(formatted, null, 2) }],
-    };
-  }
+    return jsonResult({ count: formatted.length, items: formatted });
+  })
 );
 
 server.tool(
   "get_player_count",
   "Get the current number of players in a game",
   {
-    app_id: z.number().describe("Steam application ID"),
+    app_id: z.number().int().positive().describe("Steam application ID"),
   },
-  async ({ app_id }) => {
-    try {
-      const count = await steam.getNumberOfCurrentPlayers(app_id);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ app_id, current_players: count }, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch player count: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ app_id }) => {
+    const count = await steam.getNumberOfCurrentPlayers(app_id);
+    return jsonResult({ app_id, current_players: count });
+  })
 );
 
 server.tool(
   "get_game_schema",
-  "Get the achievement and stat schema for a game (names, descriptions, icons)",
+  "Get the achievement and stat schema for a game (names, descriptions, icons). Set include_details=false for just the counts.",
   {
-    app_id: z.number().describe("Steam application ID"),
+    app_id: z.number().int().positive().describe("Steam application ID"),
+    include_details: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include full achievement/stat arrays (default true); false returns only counts"),
   },
-  async ({ app_id }) => {
-    try {
-      const schema = await steam.getSchemaForGame(app_id);
-      if (!schema) {
-        return { content: [{ type: "text", text: "Game schema not found" }] };
-      }
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                game_name: schema.gameName,
-                game_version: schema.gameVersion,
-                achievement_count:
-                  schema.availableGameStats.achievements?.length ?? 0,
-                stat_count: schema.availableGameStats.stats?.length ?? 0,
-                achievements: schema.availableGameStats.achievements,
-                stats: schema.availableGameStats.stats,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch game schema: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
+  withErrorHandling(async ({ app_id, include_details }) => {
+    const schema = await steam.getSchemaForGame(app_id);
+    if (!schema) {
+      return { content: [{ type: "text", text: "Game schema not found" }] };
     }
-  }
+    return jsonResult({
+      game_name: schema.gameName,
+      game_version: schema.gameVersion,
+      achievement_count: schema.availableGameStats.achievements?.length ?? 0,
+      stat_count: schema.availableGameStats.stats?.length ?? 0,
+      achievements: include_details ? schema.availableGameStats.achievements : undefined,
+      stats: include_details ? schema.availableGameStats.stats : undefined,
+    });
+  })
 );
 
 // === Additional Profile Tools ===
 
 server.tool(
   "get_user_groups",
-  "Get the Steam groups a player is a member of",
+  "Get the Steam groups a player is a member of. Use offset/limit to page.",
   {
     steam_id: steamIdSchema,
+    limit: limitSchema(50),
+    offset: offsetSchema,
   },
-  async ({ steam_id }) => {
-    try {
-      const groups = await steam.getUserGroupList(getSteamId(steam_id));
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ group_count: groups.length, groups }, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch groups: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ steam_id, limit, offset }) => {
+    const groups = await steam.getUserGroupList(getSteamId(steam_id));
+    const { page, total, returned, has_more } = paginate(groups, offset, limit);
+    return jsonResult({ group_count: total, returned, offset, has_more, groups: page });
+  })
 );
 
 server.tool(
@@ -983,29 +938,18 @@ server.tool(
     steam_id: steamIdSchema,
     badge_id: z
       .number()
+      .int()
+      .positive()
       .optional()
       .describe("Specific badge ID to check (omit for all badges)"),
   },
-  async ({ steam_id, badge_id }) => {
-    try {
-      const progress = await steam.getCommunityBadgeProgress(
-        getSteamId(steam_id),
-        badge_id
-      );
-      return {
-        content: [{ type: "text", text: JSON.stringify(progress, null, 2) }],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch badge progress: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ steam_id, badge_id }) => {
+    const progress = await steam.getCommunityBadgeProgress(
+      getSteamId(steam_id),
+      badge_id
+    );
+    return jsonResult(progress);
+  })
 );
 
 server.tool(
@@ -1015,39 +959,13 @@ server.tool(
     steam_id: steamIdSchema,
     app_id: z.number().describe("App ID of the game being played"),
   },
-  async ({ steam_id, app_id }) => {
-    try {
-      const info = await steam.isPlayingSharedGame(getSteamId(steam_id), app_id);
-      if (info) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                { is_shared: true, lender_steam_id: info.lender_steamid },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      }
-      return {
-        content: [
-          { type: "text", text: JSON.stringify({ is_shared: false }, null, 2) },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not check shared game: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
+  withErrorHandling(async ({ steam_id, app_id }) => {
+    const info = await steam.isPlayingSharedGame(getSteamId(steam_id), app_id);
+    if (info) {
+      return jsonResult({ is_shared: true, lender_steam_id: info.lender_steamid });
     }
-  }
+    return jsonResult({ is_shared: false });
+  })
 );
 
 // === Global Stats Tools ===
@@ -1056,76 +974,44 @@ server.tool(
   "get_global_game_stats",
   "Get global aggregated stats for a game (requires knowing stat names from schema)",
   {
-    app_id: z.number().describe("Steam application ID"),
+    app_id: z.number().int().positive().describe("Steam application ID"),
     stat_names: z
-      .array(z.string())
-      .describe("Array of stat names to retrieve (get from get_game_schema)"),
+      .array(z.string().min(1).max(100))
+      .min(1)
+      .max(50)
+      .describe("Array of stat names to retrieve, max 50 (get from get_game_schema)"),
   },
-  async ({ app_id, stat_names }) => {
-    try {
-      const stats = await steam.getGlobalStatsForGame(app_id, stat_names);
-      return {
-        content: [{ type: "text", text: JSON.stringify(stats, null, 2) }],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch global stats: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ app_id, stat_names }) => {
+    const stats = await steam.getGlobalStatsForGame(app_id, stat_names);
+    return jsonResult({ count: stats.length, stats });
+  })
 );
 
 // === App Discovery Tools ===
 
 server.tool(
   "search_apps",
-  "Search for Steam apps by name (searches the full Steam catalog)",
+  "Search for Steam apps by name. Uses Steam's relevance-ranked storefront search (returns roughly the top ~10 matches). Use offset/limit to page through them.",
   {
     query: z.string().min(1).max(100).describe("Search query to match against app names"),
-    limit: z
-      .number()
-      .min(1)
-      .max(100)
-      .optional()
-      .default(25)
-      .describe("Max results to return (default 25, max 100)"),
+    limit: limitSchema(25, 100),
+    offset: offsetSchema,
   },
-  async ({ query, limit }) => {
-    try {
-      // Security: Use cached app list to prevent repeated large API calls
-      const allApps = await getCachedAppList();
-      const queryLower = query.toLowerCase();
-      const matches = allApps
-        .filter((app) => app.name.toLowerCase().includes(queryLower))
-        .slice(0, limit);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { total_matches: matches.length, apps: matches },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not search apps: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ query, limit, offset }) => {
+    const { apps } = await steam.searchStore(query);
+    const { page, returned, has_more } = paginate(apps, offset, limit);
+    return jsonResult({
+      query,
+      // Steam's storefront search returns only the top-ranked matches (~10), not the
+      // full catalog, so this is not an exhaustive count. has_more reflects only the
+      // returned set; refine the query to surface more specific apps.
+      returned,
+      offset,
+      has_more,
+      note: "Steam returns only the top-ranked storefront matches; refine the query for more specific results.",
+      apps: page,
+    });
+  })
 );
 
 server.tool(
@@ -1133,8 +1019,10 @@ server.tool(
   "Get game servers running at a specific IP address",
   {
     address: z.string().describe("IP address or IP:port to query (public IPs only)"),
+    limit: limitSchema(50),
+    offset: offsetSchema,
   },
-  async ({ address }) => {
+  withErrorHandling(async ({ address, limit, offset }) => {
     // Security: Validate IP address format and block private/internal ranges (SSRF protection)
     if (!isValidServerAddress(address)) {
       return {
@@ -1144,73 +1032,31 @@ server.tool(
             text: "Invalid address format. Must be a public IPv4 address (e.g., '203.0.113.1' or '203.0.113.1:27015'). Private and internal IP ranges are not allowed.",
           },
         ],
+        isError: true,
       };
     }
-    try {
-      const servers = await steam.getServersAtAddress(address);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { server_count: servers.length, servers },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch servers: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+    const servers = await steam.getServersAtAddress(address);
+    const { page, total, returned, has_more } = paginate(servers, offset, limit);
+    return jsonResult({ server_count: total, returned, offset, has_more, servers: page });
+  })
 );
 
 server.tool(
   "check_app_update",
   "Check if a specific version of an app is up to date",
   {
-    app_id: z.number().describe("Steam application ID"),
-    version: z.number().describe("Current version number to check"),
+    app_id: z.number().int().positive().describe("Steam application ID"),
+    version: z.number().int().min(0).describe("Current version number to check"),
   },
-  async ({ app_id, version }) => {
-    try {
-      const info = await steam.upToDateCheck(app_id, version);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                up_to_date: info.up_to_date,
-                version_is_listable: info.version_is_listable,
-                required_version: info.required_version,
-                message: info.message,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not check update: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ app_id, version }) => {
+    const info = await steam.upToDateCheck(app_id, version);
+    return jsonResult({
+      up_to_date: info.up_to_date,
+      version_is_listable: info.version_is_listable,
+      required_version: info.required_version,
+      message: info.message,
+    });
+  })
 );
 
 // === Wishlist Tools ===
@@ -1225,74 +1071,43 @@ server.tool(
       .optional()
       .default(true)
       .describe("Include game names (default: true)"),
+    limit: limitSchema(100),
+    offset: offsetSchema,
   },
-  async ({ steam_id, include_names }) => {
-    try {
-      const wishlist = await steam.getWishlist(getSteamId(steam_id), include_names);
+  withErrorHandling(async ({ steam_id, include_names, limit, offset }) => {
+    const wishlist = await steam.getWishlist(getSteamId(steam_id), include_names);
 
-      // Sort by priority (lower priority number = higher on wishlist)
-      const sorted = [...wishlist].sort((a, b) => a.priority - b.priority);
+    // Sort by priority (lower priority number = higher on wishlist)
+    const sorted = [...wishlist].sort((a, b) => a.priority - b.priority);
 
-      const formatted = sorted.map((item) => ({
-        appid: item.appid,
-        name: item.name,
-        priority: item.priority,
-        date_added: new Date(item.date_added * 1000).toISOString(),
-      }));
+    const formatted = sorted.map((item) => ({
+      appid: item.appid,
+      name: item.name,
+      priority: item.priority,
+      date_added: new Date(item.date_added * 1000).toISOString(),
+    }));
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { wishlist_count: formatted.length, items: formatted },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch wishlist: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+    const { page, total, returned, has_more } = paginate(formatted, offset, limit);
+    return jsonResult({
+      wishlist_count: total,
+      returned,
+      offset,
+      has_more,
+      items: page,
+    });
+  })
 );
 
 server.tool(
   "get_wishlist_item_count",
   "Get the number of users who have a specific game on their wishlist",
   {
-    app_id: z.number().describe("Steam application ID"),
+    app_id: z.number().int().positive().describe("Steam application ID"),
   },
-  async ({ app_id }) => {
-    try {
-      const count = await steam.getWishlistItemCount(app_id);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ app_id, wishlist_count: count }, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch wishlist count: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async ({ app_id }) => {
+    const count = await steam.getWishlistItemCount(app_id);
+    return jsonResult({ app_id, wishlist_count: count });
+  })
 );
 
 // === Trade Tools ===
@@ -1336,121 +1151,84 @@ server.tool(
       .optional()
       .default(true)
       .describe("Include partner names (default: true)"),
+    limit: limitSchema(50),
+    offset: offsetSchema,
   },
-  async ({ get_sent, get_received, active_only, include_partner_names }) => {
-    try {
-      const offers = await steam.getTradeOffers(get_sent, get_received, active_only);
-      const allOffers = [
-        ...(offers.trade_offers_sent ?? []),
-        ...(offers.trade_offers_received ?? []),
-      ];
+  withErrorHandling(async ({ get_sent, get_received, active_only, include_partner_names, limit, offset }) => {
+    const offers = await steam.getTradeOffers(get_sent, get_received, active_only);
+    const sentRaw = (offers.trade_offers_sent ?? []).map((o) => ({ ...o, direction: "sent" as const }));
+    const receivedRaw = (offers.trade_offers_received ?? []).map((o) => ({ ...o, direction: "received" as const }));
+    const allOffers = [...sentRaw, ...receivedRaw];
 
-      // Build partner name map if needed
-      let partnerNames = new Map<number, string>();
-      if (include_partner_names && allOffers.length > 0) {
-        const accountIds = [...new Set(allOffers.map((o) => o.accountid_other))];
-        const steamIds = accountIds.map(accountIdToSteamId);
-        const summaries = await steam.getPlayerSummaries(steamIds);
-        for (const player of summaries) {
-          // Convert back to account ID for lookup
-          const accountId = Number(BigInt(player.steamid) - STEAM_ID_BASE);
-          partnerNames.set(accountId, player.personaname);
-        }
+    const total = allOffers.length;
+    // Slice to the page BEFORE resolving partner names so enrichment only runs
+    // for the offers actually returned.
+    const pageRaw = allOffers.slice(offset, offset + limit);
+
+    const partnerNames = new Map<number, string>();
+    if (include_partner_names && pageRaw.length > 0) {
+      const accountIds = [...new Set(pageRaw.map((o) => o.accountid_other))];
+      const steamIds = accountIds.map(accountIdToSteamId);
+      const summaries = await steam.getPlayerSummaries(steamIds);
+      for (const player of summaries) {
+        const accountId = Number(BigInt(player.steamid) - STEAM_ID_BASE);
+        partnerNames.set(accountId, player.personaname);
       }
-
-      const formatOffer = (offer: {
-        tradeofferid: string;
-        accountid_other: number;
-        message: string;
-        trade_offer_state: number;
-        items_to_give?: unknown[];
-        items_to_receive?: unknown[];
-        is_our_offer: boolean;
-        time_created: number;
-        expiration_time: number;
-      }) => ({
-        offer_id: offer.tradeofferid,
-        partner_name: partnerNames.get(offer.accountid_other),
-        partner_steam_id: accountIdToSteamId(offer.accountid_other),
-        message: offer.message || "(no message)",
-        state: TRADE_OFFER_STATES[offer.trade_offer_state] || "Unknown",
-        items_to_give: offer.items_to_give?.length ?? 0,
-        items_to_receive: offer.items_to_receive?.length ?? 0,
-        is_our_offer: offer.is_our_offer,
-        created: new Date(offer.time_created * 1000).toISOString(),
-        expires: new Date(offer.expiration_time * 1000).toISOString(),
-      });
-
-      const sent = (offers.trade_offers_sent ?? []).map(formatOffer);
-      const received = (offers.trade_offers_received ?? []).map(formatOffer);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                sent_count: sent.length,
-                received_count: received.length,
-                sent_offers: sent,
-                received_offers: received,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch trade offers: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
     }
-  }
+
+    const formatOffer = (offer: {
+      tradeofferid: string;
+      accountid_other: number;
+      message: string;
+      trade_offer_state: number;
+      items_to_give?: unknown[];
+      items_to_receive?: unknown[];
+      is_our_offer: boolean;
+      time_created: number;
+      expiration_time: number;
+      direction: "sent" | "received";
+    }) => ({
+      offer_id: offer.tradeofferid,
+      direction: offer.direction,
+      partner_name: partnerNames.get(offer.accountid_other),
+      partner_steam_id: accountIdToSteamId(offer.accountid_other),
+      message: offer.message || "(no message)",
+      state: TRADE_OFFER_STATES[offer.trade_offer_state] || "Unknown",
+      items_to_give: offer.items_to_give?.length ?? 0,
+      items_to_receive: offer.items_to_receive?.length ?? 0,
+      is_our_offer: offer.is_our_offer,
+      created: new Date(offer.time_created * 1000).toISOString(),
+      expires: new Date(offer.expiration_time * 1000).toISOString(),
+    });
+
+    const page = pageRaw.map(formatOffer);
+    return jsonResult({
+      trade_offer_count: total,
+      sent_count: sentRaw.length,
+      received_count: receivedRaw.length,
+      returned: page.length,
+      offset,
+      has_more: offset + page.length < total,
+      offers: page,
+    });
+  })
 );
 
 server.tool(
   "get_trade_offers_summary",
   "Get a summary of pending trade offers (counts only). Requires API key with trade permissions.",
   {},
-  async () => {
-    try {
-      const summary = await steam.getTradeOffersSummary();
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                pending_received: summary.pending_received_count,
-                new_received: summary.new_received_count,
-                updated_received: summary.updated_received_count,
-                pending_sent: summary.pending_sent_count,
-                escrow_received: summary.escrow_received_count,
-                escrow_sent: summary.escrow_sent_count,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch trade summary: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
-    }
-  }
+  withErrorHandling(async () => {
+    const summary = await steam.getTradeOffersSummary();
+    return jsonResult({
+      pending_received: summary.pending_received_count,
+      new_received: summary.new_received_count,
+      updated_received: summary.updated_received_count,
+      pending_sent: summary.pending_sent_count,
+      escrow_received: summary.escrow_received_count,
+      escrow_sent: summary.escrow_sent_count,
+    });
+  })
 );
 
 server.tool(
@@ -1474,115 +1252,82 @@ server.tool(
       .optional()
       .default(true)
       .describe("Include partner names (default: true)"),
+    offset: offsetSchema,
   },
-  async ({ max_trades, include_failed, include_partner_names }) => {
-    try {
-      const history = await steam.getTradeHistory(max_trades, include_failed, true);
+  withErrorHandling(async ({ max_trades, include_failed, include_partner_names, offset }) => {
+    // GetTradeHistory has no offset param, so fetch a superset (offset + page) and
+    // slice locally; bound the upstream fetch to keep responses sane.
+    const fetchCount = Math.min(offset + max_trades, 500);
+    const history = await steam.getTradeHistory(fetchCount, include_failed, true);
 
-      // Build partner name map if needed
-      let partnerNames = new Map<string, string>();
-      if (include_partner_names && history.trades.length > 0) {
-        const steamIds = [...new Set(history.trades.map((t) => t.steamid_other))];
-        // Batch in groups of 100 (API limit)
-        for (let i = 0; i < steamIds.length; i += 100) {
-          const batch = steamIds.slice(i, i + 100);
-          const summaries = await steam.getPlayerSummaries(batch);
-          for (const player of summaries) {
-            partnerNames.set(player.steamid, player.personaname);
-          }
+    const fetched = history.trades.length;
+    // Slice to the page BEFORE resolving partner names so enrichment only runs
+    // for the trades actually returned.
+    const pageTrades = history.trades.slice(offset, offset + max_trades);
+
+    const partnerNames = new Map<string, string>();
+    if (include_partner_names && pageTrades.length > 0) {
+      const steamIds = [...new Set(pageTrades.map((t) => t.steamid_other))];
+      // Batch in groups of 100 (API limit)
+      for (let i = 0; i < steamIds.length; i += 100) {
+        const batch = steamIds.slice(i, i + 100);
+        const summaries = await steam.getPlayerSummaries(batch);
+        for (const player of summaries) {
+          partnerNames.set(player.steamid, player.personaname);
         }
       }
-
-      const trades = history.trades.map((trade) => ({
-        trade_id: trade.tradeid,
-        partner_name: partnerNames.get(trade.steamid_other),
-        partner_steam_id: trade.steamid_other,
-        time: new Date(trade.time_init * 1000).toISOString(),
-        status: trade.status,
-        items_given: trade.assets_given?.length ?? 0,
-        items_received: trade.assets_received?.length ?? 0,
-      }));
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                total_trades: history.total_trades,
-                returned: trades.length,
-                has_more: history.more,
-                trades,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch trade history: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
-      };
     }
-  }
+
+    const trades = pageTrades.map((trade) => ({
+      trade_id: trade.tradeid,
+      partner_name: partnerNames.get(trade.steamid_other),
+      partner_steam_id: trade.steamid_other,
+      time: new Date(trade.time_init * 1000).toISOString(),
+      status: trade.status,
+      items_given: trade.assets_given?.length ?? 0,
+      items_received: trade.assets_received?.length ?? 0,
+    }));
+
+    return jsonResult({
+      total_trades: history.total_trades,
+      trade_count: fetched,
+      returned: trades.length,
+      offset,
+      // More remain if there is another page locally or the API reports more upstream.
+      has_more: offset + trades.length < fetched || history.more,
+      trades,
+    });
+  })
 );
 
 server.tool(
   "get_trade_offer",
   "Get details of a specific trade offer by ID. Requires API key with trade permissions.",
   {
-    trade_offer_id: z.string().describe("The trade offer ID to look up"),
+    trade_offer_id: z.string().min(1).describe("The trade offer ID to look up"),
   },
-  async ({ trade_offer_id }) => {
-    try {
-      const offer = await steam.getTradeOffer(trade_offer_id);
+  withErrorHandling(async ({ trade_offer_id }) => {
+    const offer = await steam.getTradeOffer(trade_offer_id);
 
-      if (!offer) {
-        return {
-          content: [{ type: "text", text: "Trade offer not found" }],
-        };
-      }
-
+    if (!offer) {
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                offer_id: offer.tradeofferid,
-                partner_account_id: offer.accountid_other,
-                message: offer.message || "(no message)",
-                state: TRADE_OFFER_STATES[offer.trade_offer_state] || "Unknown",
-                items_to_give: offer.items_to_give ?? [],
-                items_to_receive: offer.items_to_receive ?? [],
-                is_our_offer: offer.is_our_offer,
-                created: new Date(offer.time_created * 1000).toISOString(),
-                updated: new Date(offer.time_updated * 1000).toISOString(),
-                expires: new Date(offer.expiration_time * 1000).toISOString(),
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Could not fetch trade offer: ${sanitizeErrorMessage(error)}`,
-          },
-        ],
+        content: [{ type: "text", text: "Trade offer not found" }],
       };
     }
-  }
+
+    return jsonResult({
+      offer_id: offer.tradeofferid,
+      partner_account_id: offer.accountid_other,
+      message: offer.message || "(no message)",
+      state: TRADE_OFFER_STATES[offer.trade_offer_state] || "Unknown",
+      items_to_give: offer.items_to_give ?? [],
+      items_to_receive: offer.items_to_receive ?? [],
+      is_our_offer: offer.is_our_offer,
+      created: new Date(offer.time_created * 1000).toISOString(),
+      updated: new Date(offer.time_updated * 1000).toISOString(),
+      expires: new Date(offer.expiration_time * 1000).toISOString(),
+    });
+  })
 );
 
 // Start server
