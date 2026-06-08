@@ -123,8 +123,15 @@ Add to Windsurf's MCP configuration (`~/.windsurf/mcp.json`):
 |----------|----------|-------------|
 | `STEAM_API_KEY` | Yes | Your Steam Web API key |
 | `STEAM_ID` | No | Default Steam ID to use when not specified in tool calls |
+| `STEAM_HTTP_TIMEOUT_MS` | No | Per-request timeout for Steam API calls in milliseconds (default `10000`) |
 
 When `STEAM_ID` is set, you can call tools like `get_owned_games` without passing a Steam ID - it will use your default profile automatically.
+
+## Reliability & Pagination
+
+- Every Steam API request is bounded by a timeout (`STEAM_HTTP_TIMEOUT_MS`) and automatically retries transient failures (timeouts, HTTP 429, and 5xx) with exponential backoff. Non-retriable errors (401/403/404) fail fast with a clear, actionable message, and failures are returned with `isError: true`.
+- List-returning tools accept `limit` and `offset` and return a consistent envelope with the pre-slice total and a `has_more` flag, e.g. `{ "total_games": 412, "returned": 50, "offset": 0, "has_more": true, "games": [...] }`. `get_inventory` additionally returns a `next_cursor` (Steam `start_assetid`) for deep paging.
+- `search_apps` uses Steam's relevance-ranked storefront search (no full-catalog download), so it returns the top matches quickly and reliably.
 
 ## Available Tools
 
