@@ -48,7 +48,7 @@ Or use npx (no build required):
   "mcpServers": {
     "steam": {
       "command": "npx",
-      "args": ["-y", "steam-mcp-server"],
+      "args": ["-y", "@sharkusmanch/steam-mcp-server"],
       "env": {
         "STEAM_API_KEY": "your-api-key-here",
         "STEAM_ID": "your-64-bit-steam-id"
@@ -69,7 +69,7 @@ Add to your Claude Desktop configuration:
   "mcpServers": {
     "steam": {
       "command": "npx",
-      "args": ["-y", "steam-mcp-server"],
+      "args": ["-y", "@sharkusmanch/steam-mcp-server"],
       "env": {
         "STEAM_API_KEY": "your-api-key-here",
         "STEAM_ID": "your-64-bit-steam-id"
@@ -88,7 +88,7 @@ Add to Cursor's MCP settings (`.cursor/mcp.json` in your project or global confi
   "mcpServers": {
     "steam": {
       "command": "npx",
-      "args": ["-y", "steam-mcp-server"],
+      "args": ["-y", "@sharkusmanch/steam-mcp-server"],
       "env": {
         "STEAM_API_KEY": "your-api-key-here",
         "STEAM_ID": "your-64-bit-steam-id"
@@ -107,7 +107,7 @@ Add to Windsurf's MCP configuration (`~/.windsurf/mcp.json`):
   "mcpServers": {
     "steam": {
       "command": "npx",
-      "args": ["-y", "steam-mcp-server"],
+      "args": ["-y", "@sharkusmanch/steam-mcp-server"],
       "env": {
         "STEAM_API_KEY": "your-api-key-here",
         "STEAM_ID": "your-64-bit-steam-id"

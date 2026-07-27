@@ -1,5 +1,5 @@
 {
-  "name": "steam-mcp-server",
+  "name": "@sharkusmanch/steam-mcp-server",
   "version": "0.5.0",
   "description": "MCP server for Steam Web API - access game library, achievements, and player data",
   "type": "module",
